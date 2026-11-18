@@ -13,7 +13,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use pdf_writer::types::{ColorSpaceOperand, LineCapStyle, LineJoinStyle, TextRenderingMode};
-use pdf_writer::writers::MarkContent;
 use pdf_writer::{Buf, Name, Primitive, Ref, Str};
 
 use crate::display::{
@@ -169,6 +168,13 @@ pub(crate) enum Rec {
     },
     Text(RecText),
     XObject(String),
+    /// `BMC`, or `BDC` with an `/MCID` when `mcid` is set.
+    BeginMarked {
+        tag: String,
+        mcid: Option<i32>,
+    },
+    /// `EMC`.
+    EndMarked,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -577,16 +583,29 @@ impl Content {
 
     pub(crate) fn begin_marked_content(&mut self, tag: Name) -> &mut Self {
         self.inner.begin_marked_content(tag);
+        self.record_marked(tag, None);
         self
     }
 
-    pub(crate) fn begin_marked_content_with_properties(&mut self, tag: Name) -> MarkContent<'_> {
-        self.inner.begin_marked_content_with_properties(tag)
+    /// `/tag <</MCID mcid>> BDC`: content of a structure element.
+    pub(crate) fn begin_tagged(&mut self, tag: Name, mcid: i32) -> &mut Self {
+        self.inner
+            .begin_marked_content_with_properties(tag)
+            .properties()
+            .identify(mcid);
+        self.record_marked(tag, Some(mcid));
+        self
     }
 
     pub(crate) fn end_marked_content(&mut self) -> &mut Self {
         self.inner.end_marked_content();
+        self.record(|r| r.push(Rec::EndMarked));
         self
+    }
+
+    fn record_marked(&mut self, tag: Name, mcid: Option<i32>) {
+        let tag = String::from_utf8_lossy(tag.0).into_owned();
+        self.record(|r| r.push(Rec::BeginMarked { tag, mcid }));
     }
 }
 
@@ -927,6 +946,41 @@ mod tests {
             c.end_path();
         });
         assert!(matches!(items.as_slice(), [Rec::Clip { .. }]));
+    }
+
+    #[test]
+    fn records_marked_content_as_written() {
+        let (bytes, items) = recorded(|c| {
+            c.begin_marked_content(Name(b"Artifact"));
+            c.end_marked_content();
+            c.begin_tagged(Name(b"P"), 3);
+            c.end_marked_content();
+        });
+        let mut plain = pdf_writer::Content::new();
+        plain.begin_marked_content(Name(b"Artifact"));
+        plain.end_marked_content();
+        plain
+            .begin_marked_content_with_properties(Name(b"P"))
+            .properties()
+            .identify(3);
+        plain.end_marked_content();
+        assert_eq!(bytes, plain.finish().to_vec());
+        let [
+            Rec::BeginMarked {
+                tag: artifact,
+                mcid: None,
+            },
+            Rec::EndMarked,
+            Rec::BeginMarked {
+                tag: p,
+                mcid: Some(3),
+            },
+            Rec::EndMarked,
+        ] = items.as_slice()
+        else {
+            panic!("unexpected items: {items:?}");
+        };
+        assert_eq!((artifact.as_str(), p.as_str()), ("Artifact", "P"));
     }
 
     #[test]
