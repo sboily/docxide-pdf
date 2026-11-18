@@ -125,6 +125,7 @@ impl<'a> Builder<'a> {
         language: &str,
         structure: Option<Structure>,
         outline: Vec<OutlineEntry>,
+        pdf_ua: bool,
     ) -> DisplayDocument {
         self.document.structure = structure;
         self.document.outline = outline;
@@ -134,6 +135,7 @@ impl<'a> Builder<'a> {
             subject: doc.subject.clone(),
             keywords: doc.keywords.clone(),
             language: (!language.is_empty()).then(|| language.to_string()),
+            pdf_ua,
         };
         self.document
     }
