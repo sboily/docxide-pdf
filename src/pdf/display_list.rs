@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::display::{
     DisplayDocument, FillRule, Font, FontSource, Glyph, GradientStop, Info, Item, LinearGradient,
-    Link, LinkTarget, Matrix, Page, Paint, Path, Segment, TextRun,
+    Link, LinkTarget, Mark, Matrix, OutlineEntry, Page, Paint, Path, Segment, Structure, TextRun,
 };
 use crate::fonts::FontEntry;
 use crate::model::Document;
@@ -49,6 +49,9 @@ pub(super) struct Builder<'a> {
     text_ends: HashMap<u32, Matrix>,
     /// The gradients of the page being built, by pattern name.
     gradients: HashMap<String, LinearGradient>,
+    /// The marked sequences open in the stream being resolved: whether each
+    /// was described (and so needs its end).
+    marks: Vec<bool>,
     document: DisplayDocument,
 }
 
@@ -72,6 +75,7 @@ impl<'a> Builder<'a> {
             image_index: HashMap::new(),
             text_ends: HashMap::new(),
             gradients: HashMap::new(),
+            marks: Vec::new(),
             document: DisplayDocument::default(),
         }
     }
@@ -86,14 +90,16 @@ impl<'a> Builder<'a> {
             .iter()
             .map(|spec| (spec.pattern_name.clone(), gradient(spec)))
             .collect();
+        // Headers, footers, borders and the comment pane are artifacts, as
+        // `tagging::wrap_artifact` writes them.
         let mut items = Vec::new();
         if let Some(header_footer) = page.header_footer {
             let mut group: Vec<Item> = page.zoom.map(Item::Transform).into_iter().collect();
-            group.extend(self.stream(header_footer));
+            group.extend(artifact(self.stream(header_footer), true));
             items.push(Item::Group(group));
         }
         if let Some(borders) = page.borders {
-            items.push(Item::Group(self.stream(borders)));
+            items.push(Item::Group(artifact(self.stream(borders), false)));
         }
         let mut zoomed: Vec<Item> = page.zoom.map(Item::Transform).into_iter().collect();
         for stream in page.body {
@@ -103,7 +109,7 @@ impl<'a> Builder<'a> {
         body.push(Item::Group(zoomed));
         items.push(Item::Group(body));
         if let Some(pane) = page.comment_pane {
-            items.push(Item::Group(self.stream(pane)));
+            items.push(Item::Group(artifact(self.stream(pane), false)));
         }
         self.document.pages.push(Page {
             width: page.width,
@@ -113,7 +119,15 @@ impl<'a> Builder<'a> {
         });
     }
 
-    pub(super) fn finish(mut self, doc: &Document, language: &str) -> DisplayDocument {
+    pub(super) fn finish(
+        mut self,
+        doc: &Document,
+        language: &str,
+        structure: Option<Structure>,
+        outline: Vec<OutlineEntry>,
+    ) -> DisplayDocument {
+        self.document.structure = structure;
+        self.document.outline = outline;
         self.document.info = Info {
             title: doc.title.clone(),
             author: doc.author.clone(),
@@ -128,11 +142,20 @@ impl<'a> Builder<'a> {
         *self.document.unsupported.entry(what).or_default() += 1;
     }
 
-    /// One content stream: its text objects are its own.
+    /// One content stream: its text objects are its own, and the marked
+    /// sequences it leaves open end with it (a body stream's artifact, which
+    /// `tagging::finish_artifact_content` closes).
     fn stream(&mut self, items: Vec<Rec>) -> Vec<Item> {
         let saved = std::mem::take(&mut self.text_ends);
-        let resolved = self.items(items, None, 0);
+        let saved_marks = std::mem::take(&mut self.marks);
+        let mut resolved = self.items(items, None, 0);
+        while let Some(described) = self.marks.pop() {
+            if described {
+                end_marked(&mut resolved);
+            }
+        }
         self.text_ends = saved;
+        self.marks = saved_marks;
         resolved
     }
 
@@ -183,6 +206,17 @@ impl<'a> Builder<'a> {
                         out.push(Item::Text(run));
                     }
                 }
+                Rec::BeginMarked { tag, mcid } => {
+                    let mark = self.mark(tag, mcid);
+                    self.marks.push(mark.is_some());
+                    out.extend(mark.map(Item::BeginMarked));
+                }
+                // An end without its beginning is ignored, as viewers do.
+                Rec::EndMarked => {
+                    if self.marks.pop() == Some(true) {
+                        end_marked(&mut out);
+                    }
+                }
                 Rec::XObject(name) => {
                     let reference = match xobjects {
                         Some(local) => local.get(&name).copied(),
@@ -196,6 +230,22 @@ impl<'a> Builder<'a> {
             }
         }
         out
+    }
+
+    /// A marked sequence: a structure element's content (it has an MCID), or
+    /// an artifact. Other marks are counted and left out, their content kept.
+    fn mark(&mut self, tag: String, mcid: Option<i32>) -> Option<Mark> {
+        let mark = match mcid {
+            Some(mcid) => u32::try_from(mcid)
+                .ok()
+                .map(|mcid| Mark::Element { tag, mcid }),
+            None if tag == "Artifact" => Some(Mark::Artifact { pagination: false }),
+            None => None,
+        };
+        if mark.is_none() {
+            self.unsupported("marked content not described");
+        }
+        mark
     }
 
     /// A pattern stroked, or text painted with one, is not described yet: counted, not drawn.
@@ -359,6 +409,26 @@ impl<'a> Builder<'a> {
     }
 }
 
+/// Ends the marked sequence open in `items`. An artifact with nothing in it
+/// is dropped, as `tagging::finish_artifact_content` drops it.
+fn end_marked(items: &mut Vec<Item>) {
+    if matches!(items.last(), Some(Item::BeginMarked(Mark::Artifact { .. }))) {
+        items.pop();
+    } else {
+        items.push(Item::EndMarked);
+    }
+}
+
+/// `items` as one artifact, of the page's pagination (headers and footers)
+/// or not.
+fn artifact(items: Vec<Item>, pagination: bool) -> Vec<Item> {
+    let mut wrapped = Vec::with_capacity(items.len() + 2);
+    wrapped.push(Item::BeginMarked(Mark::Artifact { pagination }));
+    wrapped.extend(items);
+    end_marked(&mut wrapped);
+    wrapped
+}
+
 /// A shape's gradient as the PDF export writes its pattern: an axial shading along
 /// `GradientSpec::axis`, extended both ways, interpolated in linear light (`CalRGB`).
 fn gradient(spec: &GradientSpec) -> LinearGradient {
@@ -492,5 +562,104 @@ mod tests {
         // Every stub glyph is 500 units: 5pt at 10pt, plus the 1pt TJ move.
         assert_eq!(first.glyphs[1].x, 5.0);
         assert_eq!(second.matrix, translate(111.0, 200.0));
+    }
+
+    fn square() -> Rec {
+        Rec::Fill {
+            path: Path(vec![Segment::Rect(0.0, 0.0, 1.0, 1.0)]),
+            fill_rule: FillRule::NonZero,
+            paint: RecPaint::Solid(Paint {
+                color: crate::display::Color::Gray(0.0),
+                alpha: 1.0,
+            }),
+        }
+    }
+
+    fn marked(tag: &str, mcid: Option<i32>) -> Rec {
+        Rec::BeginMarked {
+            tag: tag.into(),
+            mcid,
+        }
+    }
+
+    #[test]
+    fn a_body_stream_keeps_its_marks_as_written() {
+        let fonts = HashMap::new();
+        let xobjects = HashMap::new();
+        let mut builder = Builder::new(&fonts, &[], &xobjects);
+        // As `tagging` writes a body stream: the artifact, closed for a tagged
+        // region and opened again, left open for the end of the stream.
+        let items = builder.stream(vec![
+            marked("Artifact", None),
+            Rec::EndMarked,
+            marked("P", Some(0)),
+            Rec::Group(vec![square(), Rec::EndMarked]),
+            marked("Artifact", None),
+            square(),
+            Rec::EndMarked,
+            Rec::EndMarked,
+        ]);
+        let [
+            Item::BeginMarked(Mark::Element { tag, mcid: 0 }),
+            Item::Group(group),
+            Item::BeginMarked(Mark::Artifact { pagination: false }),
+            Item::Fill { .. },
+            Item::EndMarked,
+        ] = items.as_slice()
+        else {
+            panic!("unexpected items: {items:?}");
+        };
+        assert_eq!(tag, "P");
+        assert!(matches!(
+            group.as_slice(),
+            [Item::Fill { .. }, Item::EndMarked]
+        ));
+    }
+
+    #[test]
+    fn page_furniture_is_marked_as_artifacts() {
+        let fonts = HashMap::new();
+        let xobjects = HashMap::new();
+        let mut builder = Builder::new(&fonts, &[], &xobjects);
+        let page = RecordedPage {
+            width: 100.0,
+            height: 100.0,
+            header_footer: Some(vec![square()]),
+            borders: Some(vec![square()]),
+            zoom: None,
+            valign: None,
+            body: vec![vec![marked("Artifact", None), square()]],
+            comment_pane: None,
+        };
+        builder.add_page(page, Vec::new(), &[]);
+        let items = &builder.document.pages[0].items;
+        let [Item::Group(header), Item::Group(borders), Item::Group(body)] = items.as_slice()
+        else {
+            panic!("unexpected items: {items:?}");
+        };
+        assert!(matches!(
+            header.as_slice(),
+            [
+                Item::BeginMarked(Mark::Artifact { pagination: true }),
+                Item::Fill { .. },
+                Item::EndMarked
+            ]
+        ));
+        assert!(matches!(
+            borders.as_slice(),
+            [
+                Item::BeginMarked(Mark::Artifact { pagination: false }),
+                Item::Fill { .. },
+                Item::EndMarked
+            ]
+        ));
+        // The body stream's artifact ends with it.
+        let [Item::Group(zoomed)] = body.as_slice() else {
+            panic!("unexpected body: {body:?}");
+        };
+        let [Item::Group(stream)] = zoomed.as_slice() else {
+            panic!("unexpected body: {zoomed:?}");
+        };
+        assert!(matches!(stream.last(), Some(Item::EndMarked)));
     }
 }
