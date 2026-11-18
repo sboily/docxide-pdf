@@ -669,7 +669,7 @@ pub(super) fn assemble_pdf_pages(
                     y: entry.y_position,
                 })
                 .collect();
-            let document = builder.finish(doc, lang, structure, outline);
+            let document = builder.finish(doc, lang, structure, outline, claims_ua);
             session.document = Some(document);
         });
     }

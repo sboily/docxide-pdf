@@ -44,6 +44,10 @@ pub struct Info {
     pub keywords: Option<String>,
     /// BCP 47 language tag of the document's text.
     pub language: Option<String>,
+    /// Whether the export claims PDF/UA-1: the document is tagged and passes the checks that
+    /// depend on it (a title, alternate text on every figure, headings in order, every font
+    /// embedded, no `.notdef` drawn).
+    pub pdf_ua: bool,
 }
 
 /// One page.
