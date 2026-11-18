@@ -1,0 +1,1030 @@
+use crate::model::{Block, Paragraph, Run, TabAlignment, TabStop};
+
+use super::images::compute_drawing_info;
+use super::numbering::{ListCounters, ListLabelInfo, parse_list_info};
+use super::runs::{parse_runs, push_textbox};
+use super::styles::{ParagraphStyle, StyleDefaults, StylesInfo, half_points};
+use super::vml_shape::collect_textboxes_from_paragraph;
+use super::{
+    IndentChars, ParseContext, WML_NS, apply_indent_chars, extract_indent_chars, extract_indents,
+    parse_frame_props, parse_paragraph_borders, parse_paragraph_spacing, wml, wml_attr, wml_bool,
+};
+
+/// Options controlling which paragraph features to resolve.
+#[derive(Default)]
+pub(super) struct ParagraphOptions {
+    /// Whether to resolve bookmarks from the node
+    pub resolve_bookmarks: bool,
+    /// Whether to resolve outline_level
+    pub resolve_outline_level: bool,
+    /// Whether to resolve drawing info (images/charts/smartart) from the node
+    pub resolve_drawings: bool,
+    /// Whether to collect additional textboxes from the paragraph node
+    pub collect_extra_textboxes: bool,
+    /// Style-level numbering ID fallback (from paragraph style)
+    pub style_num_id: Option<String>,
+    /// Style-level numbering ilvl fallback
+    pub style_num_ilvl: Option<u8>,
+}
+
+pub(super) fn build_paragraph<R: std::io::Read + std::io::Seek>(
+    node: roxmltree::Node,
+    ctx: &mut ParseContext<'_, R>,
+    lists: &mut ListCounters,
+    opts: &ParagraphOptions,
+) -> Paragraph {
+    let ppr = wml(node, "pPr");
+
+    let ppr_rpr = ppr.and_then(|ppr| wml(ppr, "rPr"));
+    let paragraph_mark_vanish = ppr_rpr
+        .and_then(|rpr| wml_bool(rpr, "vanish"))
+        .unwrap_or(false);
+
+    let (para_style_id, para_style) = ctx.styles.paragraph_style_of(ppr);
+
+    let mark = super::runs::paragraph_mark_run(ppr, para_style, ctx);
+    let paragraph_mark_font_size = Some(mark.font_size);
+    let paragraph_mark_font_name = Some(mark.font_name.clone());
+    let paragraph_mark_position = paragraph_mark_position(ppr_rpr, para_style);
+
+    let borders = borders(ppr, para_style);
+    let (sp_before, sp_after, line_spacing) =
+        parse_paragraph_spacing(ppr, para_style, &ctx.styles.defaults, ctx.line_unit);
+    let space_before = sp_before.unwrap_or(ctx.styles.defaults.space_before);
+    let space_after = sp_after.unwrap_or(ctx.styles.defaults.space_after);
+
+    let para_shading = shading(ppr, para_style);
+
+    let style_color = para_style.and_then(|s| s.run.color);
+
+    let alignment = super::runs::paragraph_alignment(node, ppr, para_style)
+        .unwrap_or(ctx.styles.defaults.alignment);
+
+    let contextual_spacing = contextual_spacing(ppr, para_style);
+
+    let keep_next = keep_next(ppr, para_style);
+
+    // Word never splits display math over pages: a wrapped equation that
+    // doesn't fit moves whole (probe `mp20_relpos`).
+    let keep_lines = keep_lines(ppr, para_style) || super::runs::display_math(node).is_some();
+
+    let widow_control = widow_control(ppr, para_style, &ctx.styles.defaults);
+    // ponytail: direct formatting only; read the style's when a fixture sets it there.
+    let suppress_line_numbers = ppr
+        .and_then(|ppr| wml_bool(ppr, "suppressLineNumbers"))
+        .unwrap_or(false);
+    let break_words = ppr
+        .and_then(|ppr| wml_bool(ppr, "wordWrap"))
+        .or_else(|| para_style.and_then(|s| s.word_wrap))
+        == Some(false);
+
+    let snap_to_grid = snap_to_grid(ppr, para_style);
+
+    let (auto_space_de, auto_space_dn) = auto_space(ppr, para_style);
+
+    let bidi = ppr
+        .and_then(|ppr| wml_bool(ppr, "bidi"))
+        .or_else(|| para_style.and_then(|s| s.bidi))
+        .unwrap_or(ctx.styles.defaults.bidi);
+
+    let num_pr = ppr.and_then(|ppr| wml(ppr, "numPr"));
+    let style_num = opts.style_num_id.as_deref();
+    let style_ilvl = opts.style_num_ilvl;
+    let numbering = parse_list_info(
+        num_pr,
+        style_num,
+        style_ilvl,
+        Some(para_style_id),
+        &ctx.styles.paragraph_styles,
+        ctx.numbering,
+        lists,
+        Some(&mark),
+        super::numbering::item_revision(node, ctx.revisions),
+    );
+    let (mut indents, indent_chars) =
+        resolve_indents(ppr, para_style, &numbering, &ctx.styles.defaults);
+    let num_tab_stop = num_tab_override(ppr).or(numbering.tab_stop);
+
+    let parsed = parse_runs(node, ctx);
+    apply_indent_chars(
+        &mut indents,
+        indent_chars,
+        indent_char_widths(&parsed.runs, para_style, &ctx.styles, ctx.grid_char_delta),
+    );
+    let (indent_left, indent_right, indent_hanging, indent_first_line) = indents;
+    let mut runs = parsed.runs;
+
+    let mark_deleted = ppr_rpr.is_some_and(|rpr| super::revised_mark(rpr, "del").is_some());
+    // Markup view: a revised paragraph mark or paragraph formatting
+    // (`w:pPrChange`) draws no inline mark, only the change bar.
+    let mark_revised = ctx.revisions.markup
+        && (mark_deleted
+            || ppr_rpr.is_some_and(|rpr| super::revised_mark(rpr, "ins").is_some())
+            || ppr.is_some_and(|p| wml(p, "pPrChange").is_some()));
+    if mark_revised {
+        for run in &mut runs {
+            run.revised = true;
+        }
+    }
+
+    if let Some(color) = style_color {
+        for run in &mut runs {
+            run.color.get_or_insert(color);
+        }
+    }
+
+    let mut tab_stops = super::resolve_tab_stops(ppr, para_style);
+    // Add the numbering level's explicit tab stop so the label-text
+    // gap matches Word (which uses this instead of the implicit
+    // hanging-indent tab when it is closer).
+    if let Some(nts) = num_tab_stop
+        && !tab_stops.iter().any(|t| (t.position - nts).abs() < 0.5)
+    {
+        tab_stops.push(TabStop {
+            position: nts,
+            alignment: TabAlignment::Left,
+            leader: None,
+        });
+        tab_stops.sort_by(|a, b| a.position.total_cmp(&b.position));
+    }
+    // doNotUseIndentAsNumberingTabStop: the indent is no tab stop either
+    // (`list_label::text_hanging` skips it too).
+    if !ctx.styles.defaults.no_indent_as_num_tab {
+        add_hanging_tab_stop(&mut tab_stops, indent_left, indent_hanging);
+    }
+
+    let has_text = runs.iter().any(|r| !r.text.is_empty() || r.is_tab);
+    // A hidden picture is not shown (Word example: a paragraph of only a hidden
+    // picture is an empty line of its mark).
+    let shown_images = runs.iter().filter(|r| r.shown_image().is_some()).count();
+    let has_inline_images = runs.iter().any(|r| r.inline_image.is_some());
+
+    let floating_images = parsed.floating_images;
+
+    let (para_image, mut content_height) = if !opts.resolve_drawings {
+        (None, 0.0)
+    } else if !has_text && shown_images == 1 && !runs.iter().any(Run::underlined_picture) {
+        crate::model::take_shown_image(&mut runs)
+    } else if !has_text && shown_images > 0 {
+        // Picture-only paragraph laid out as runs (several pictures, or an
+        // underlined one, whose line keeps the run font's descent for the
+        // underline): expose the tallest picture height for vertical sizing.
+        let max_h = runs
+            .iter()
+            .filter_map(Run::shown_image)
+            .map(|i| i.display_height + i.layout_extra_height)
+            .fold(0.0f32, f32::max);
+        (None, max_h)
+    } else if has_inline_images {
+        (None, 0.0)
+    } else {
+        let drawing = compute_drawing_info(node, ctx);
+        (drawing.image, drawing.height)
+    };
+
+    if let Some(ref ic) = parsed.inline_chart {
+        content_height = content_height.max(ic.display_height);
+    }
+    let (floating_smartart, smartart): (Vec<_>, Vec<_>) = parsed
+        .smartart
+        .into_iter()
+        .partition(|d| d.anchor.is_some());
+    for sa in &smartart {
+        content_height = content_height.max(sa.display_height);
+    }
+
+    let outline_level = if opts.resolve_outline_level {
+        ppr.and_then(|ppr| wml_attr(ppr, "outlineLvl"))
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|&lvl| lvl <= 9)
+            .or_else(|| para_style.and_then(|s| s.outline_level))
+            // Level 9 is body text: it overrides the style's heading level.
+            .filter(|&lvl| lvl <= 8)
+    } else {
+        None
+    };
+
+    let bookmarks: Vec<String> = if opts.resolve_bookmarks {
+        node.children()
+            .filter(|n| n.has_tag_name((WML_NS, "bookmarkStart")))
+            .filter_map(|n| n.attribute((WML_NS, "name")).map(|s| s.to_string()))
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let textboxes = {
+        let mut tbs = parsed.textboxes;
+        if opts.collect_extra_textboxes {
+            for tb in collect_textboxes_from_paragraph(node, ctx) {
+                push_textbox(&floating_images, &mut tbs, tb);
+            }
+        }
+        tbs
+    };
+
+    let (space_before_auto, space_after_auto) =
+        super::autospacing(ppr, para_style, &ctx.styles.defaults);
+    // A frame never splits: Word drops a break that ends or splits it, and
+    // one opening it moves it to the next column (Word examples: a page break
+    // opening a frame in two columns puts it in column 2 of the same page).
+    let frame_props = parse_frame_props(ppr, para_style.and_then(|s| s.frame_attrs.as_ref()));
+    let framed = frame_props.is_some();
+    let explicit_page_break = parsed.has_explicit_page_break_before && !framed;
+    Paragraph {
+        kashida_reserve: ctx.text_width * super::runs::paragraph_kashida(ppr, para_style),
+        runs,
+        deleted_text: parsed.deleted_text,
+        mark_deleted,
+        mark_revised,
+        style_id: Some(para_style_id.to_string()),
+        space_before,
+        space_after,
+        space_before_auto,
+        space_after_auto,
+        content_height,
+        // w:bidi mirrors the paragraph: left/start aligns and indents on the
+        // right, right/end on the left (Word probes 2026-10-13: jc none, left
+        // and start end lines at the right margin, right and end at the left;
+        // w:left 720 + firstLine 360 keeps 36pt on the right and starts the
+        // first line 18pt further in). firstLine/hanging stay start-side
+        // amounts, which layout applies on the right (`TextLine::rtl_paragraph`).
+        alignment: if bidi { mirrored(alignment) } else { alignment },
+        indent_left: if bidi { indent_right } else { indent_left },
+        indent_right: if bidi { indent_left } else { indent_right },
+        indent_hanging,
+        indent_first_line,
+        starts_toc_field: node.descendants().any(|n| {
+            n.has_tag_name((WML_NS, "instrText"))
+                && n.text().is_some_and(super::field_code::is_toc_instr)
+        }),
+        num_level_tab_stop: num_tab_stop,
+        no_indent_num_tab: ctx.styles.defaults.no_indent_as_num_tab,
+        contextual_spacing,
+        keep_next,
+        keep_lines,
+        suppress_line_numbers,
+        break_words,
+        widow_control,
+        line_spacing,
+        image: para_image,
+        borders,
+        shading: para_shading,
+        // A direct pageBreakBefore, on or off, overrides the style's
+        // (wa_child's Part 1 heading turns its Heading2 break off).
+        page_break_before: explicit_page_break
+            || ppr
+                .and_then(|ppr| wml_bool(ppr, "pageBreakBefore"))
+                .unwrap_or_else(|| {
+                    para_style
+                        .and_then(|s| s.page_break_before)
+                        .unwrap_or(false)
+                }),
+        page_break_before_explicit: explicit_page_break,
+        page_break_after: parsed.has_page_break_after && !framed,
+        page_break_at: parsed.page_break_at.filter(|_| !framed),
+        column_break_before: parsed.has_column_break
+            || (parsed.has_explicit_page_break_before && framed),
+        // split_at_page_break hands a mid-paragraph one to the continuation
+        column_break_after: parsed.column_break_at && !framed,
+        clears_floats: parsed.has_clear_break,
+        tab_stops,
+        floating_images,
+        textboxes,
+        connectors: parsed.connectors,
+        inline_chart: parsed.inline_chart,
+        smartart,
+        floating_smartart,
+        horizontal_rule: parsed.horizontal_rule,
+        horizontal_rule_at: parsed.horizontal_rule_at,
+        field_code_mark: parsed.mark_in_field_code,
+        toc_field: parsed.toc_instr,
+        is_section_break: false,
+        bookmarks,
+        outline_level,
+        paragraph_mark_vanish,
+        paragraph_mark_font_size,
+        paragraph_mark_font_name,
+        paragraph_mark_position,
+        text_alignment: text_alignment(ppr, para_style, &ctx.styles.defaults),
+        snap_to_grid,
+        auto_space_de,
+        auto_space_dn,
+        bidi,
+        frame_props,
+        ..numbering.into_paragraph()
+    }
+}
+
+fn mirrored(alignment: crate::model::Alignment) -> crate::model::Alignment {
+    use crate::model::Alignment::{Left, Right};
+    match alignment {
+        Left => Right,
+        Right => Left,
+        other => other,
+    }
+}
+
+/// A paragraph whose mark lies inside a field's code continues into the next
+/// one: Word shows neither the code nor the mark (geneva_waste's letterhead
+/// cell lays out two lines, not six).
+// ponytail: the first paragraph's properties win; Word uses the surviving mark's.
+pub(super) fn merge_field_code_paragraphs(blocks: &mut Vec<Block>) {
+    let [.., Block::Paragraph(prev), Block::Paragraph(next)] = &mut blocks[..] else {
+        return;
+    };
+    if !prev.field_code_mark {
+        return;
+    }
+    prev.runs.append(&mut next.runs);
+    prev.floating_images.append(&mut next.floating_images);
+    prev.textboxes.append(&mut next.textboxes);
+    prev.field_code_mark = next.field_code_mark;
+    blocks.pop();
+}
+
+/// OOXML 17.3.1.38: a hanging indent implicitly sets a tab stop at the indent.
+pub(super) fn add_hanging_tab_stop(tab_stops: &mut Vec<TabStop>, indent_left: f32, hanging: f32) {
+    if hanging > 0.0
+        && !tab_stops
+            .iter()
+            .any(|t| (t.position - indent_left).abs() < 0.5)
+    {
+        tab_stops.push(TabStop {
+            position: indent_left,
+            alignment: TabAlignment::Left,
+            leader: None,
+        });
+        tab_stops.sort_by(|a, b| a.position.total_cmp(&b.position));
+    }
+}
+
+/// Word moves the text after a page break inside a paragraph to the next page
+/// and lays it out as the paragraph's continuation: no list label, no
+/// first-line indent, no space before. The paragraph's space after, keep-next
+/// and section break belong to its end, i.e. the continuation.
+pub(super) fn split_at_page_break(para: &mut Paragraph) -> Option<Paragraph> {
+    let at = para.page_break_at.take()?;
+    let runs = para.runs.split_off(at);
+    Some(continuation(para, runs))
+}
+
+/// Word lays an inline `o:hr` among text out as an object on a line of its
+/// own, the text before and after it on lines of their own, with no space
+/// between them (Word online probe, 12pt Aptos with 8pt after: text, rule
+/// and the next paragraph step 17, 17 + 8; the rule sits 0.9pt below its
+/// line's baseline, as on a rule-only paragraph). Split there into
+/// paragraphs, the rule's holding only its mark.
+pub(super) fn split_at_horizontal_rule(para: &mut Paragraph) -> Vec<Paragraph> {
+    let Some(at) = para.horizontal_rule_at.take() else {
+        return Vec::new();
+    };
+    let visible = |runs: &[Run]| {
+        runs.iter()
+            .any(|r| !r.vanish && (!r.text.trim().is_empty() || r.inline_image.is_some()))
+    };
+    let after = para.runs.split_off(at.min(para.runs.len()));
+    let (text_before, text_after) = (visible(&para.runs), visible(&after));
+    if !text_before && !text_after {
+        para.runs.extend(after);
+        return Vec::new();
+    }
+    let mark = |r: &Run| Run {
+        font_size: r.font_size,
+        font_size_from_default: r.font_size_from_default,
+        font_name_from_default: r.font_name_from_default,
+        font_name: r.font_name.clone(),
+        ..Run::default()
+    };
+    if !text_before {
+        let mark_run = mark(&after[0]);
+        para.runs = vec![mark_run];
+        return vec![continuation(para, after)];
+    }
+    let mark_run = mark(&para.runs[para.runs.len() - 1]);
+    let mut rule = continuation(para, vec![mark_run]);
+    rule.horizontal_rule = para.horizontal_rule.take();
+    if !text_after {
+        return vec![rule];
+    }
+    let rest = continuation(&mut rule, after);
+    vec![rule, rest]
+}
+
+/// The paragraph `runs` continue `para` with: its formatting without the
+/// list label, first-line indent or space before; the space after,
+/// keep-next and section break move to it.
+fn continuation(para: &mut Paragraph, runs: Vec<Run>) -> Paragraph {
+    Paragraph {
+        runs,
+        column_break_before: std::mem::take(&mut para.column_break_after),
+        style_id: para.style_id.clone(),
+        space_after: std::mem::take(&mut para.space_after),
+        space_after_auto: std::mem::take(&mut para.space_after_auto),
+        alignment: para.alignment,
+        indent_left: para.indent_left,
+        indent_right: para.indent_right,
+        contextual_spacing: para.contextual_spacing,
+        keep_next: std::mem::take(&mut para.keep_next),
+        field_code_mark: std::mem::take(&mut para.field_code_mark),
+        keep_lines: para.keep_lines,
+        suppress_line_numbers: para.suppress_line_numbers,
+        break_words: para.break_words,
+        widow_control: para.widow_control,
+        line_spacing: para.line_spacing,
+        borders: para.borders.clone(),
+        shading: para.shading,
+        tab_stops: para.tab_stops.clone(),
+        paragraph_mark_vanish: para.paragraph_mark_vanish,
+        paragraph_mark_font_size: para.paragraph_mark_font_size,
+        paragraph_mark_font_name: para.paragraph_mark_font_name.clone(),
+        paragraph_mark_position: para.paragraph_mark_position,
+        text_alignment: para.text_alignment,
+        snap_to_grid: para.snap_to_grid,
+        auto_space_de: para.auto_space_de,
+        auto_space_dn: para.auto_space_dn,
+        bidi: para.bidi,
+        ..Paragraph::default()
+    }
+}
+
+/// The paragraph mark's `w:position`, from its own rPr or the paragraph style.
+/// Shared by body and table-cell paragraphs.
+pub(super) fn paragraph_mark_position(
+    ppr_rpr: Option<roxmltree::Node>,
+    para_style: Option<&ParagraphStyle>,
+) -> f32 {
+    ppr_rpr
+        .and_then(|rpr| half_points(rpr, "position"))
+        .or_else(|| para_style.and_then(|s| s.run.position))
+        .unwrap_or(0.0)
+}
+
+/// `w:widowControl`, direct, from the style or the document defaults.
+pub(super) fn widow_control(
+    ppr: Option<roxmltree::Node>,
+    para_style: Option<&ParagraphStyle>,
+    defaults: &StyleDefaults,
+) -> bool {
+    ppr.and_then(|ppr| wml_bool(ppr, "widowControl"))
+        .or_else(|| para_style.and_then(|s| s.widow_control))
+        .unwrap_or(defaults.widow_control)
+}
+
+pub(super) fn borders(
+    ppr: Option<roxmltree::Node>,
+    para_style: Option<&ParagraphStyle>,
+) -> crate::model::ParagraphBorders {
+    let own = ppr.map(parse_paragraph_borders).unwrap_or_default();
+    match para_style {
+        Some(s) => own.over(&s.borders),
+        None => own,
+    }
+    .resolve()
+}
+
+/// `w:keepNext`, direct or from the style.
+pub(super) fn keep_next(ppr: Option<roxmltree::Node>, para_style: Option<&ParagraphStyle>) -> bool {
+    ppr.and_then(|ppr| wml_bool(ppr, "keepNext"))
+        .or_else(|| para_style.and_then(|s| s.keep_next))
+        .unwrap_or(false)
+}
+
+/// `w:snapToGrid`, on unless the paragraph or its style turns it off.
+pub(super) fn snap_to_grid(
+    ppr: Option<roxmltree::Node>,
+    para_style: Option<&ParagraphStyle>,
+) -> bool {
+    ppr.and_then(|ppr| wml_bool(ppr, "snapToGrid"))
+        .or_else(|| para_style.and_then(|s| s.snap_to_grid))
+        .unwrap_or(true)
+}
+
+/// A paragraph-level `<w:tab val="num" pos="..."/>` overrides the numbering
+/// level's num tab (paired with a `clear` of the inherited value when
+/// Word-authored). `pos="0"` is a Word sentinel meaning "disable the num
+/// tab for this paragraph" — ignore it so we don't collapse text onto the
+/// label.
+pub(super) fn num_tab_override(ppr: Option<roxmltree::Node>) -> Option<f32> {
+    ppr.and_then(|ppr| wml(ppr, "tabs"))?
+        .children()
+        .filter(|t| t.has_tag_name((WML_NS, "tab")) && t.attribute((WML_NS, "val")) == Some("num"))
+        .filter_map(|t| super::twips_attr(t, "pos"))
+        .rfind(|&pos| pos > 0.0)
+}
+
+/// `w:keepLines`, direct or from the style.
+pub(super) fn keep_lines(
+    ppr: Option<roxmltree::Node>,
+    para_style: Option<&ParagraphStyle>,
+) -> bool {
+    ppr.and_then(|ppr| wml_bool(ppr, "keepLines"))
+        .or_else(|| para_style.and_then(|s| s.keep_lines))
+        .unwrap_or(false)
+}
+
+/// `w:autoSpaceDE` and `w:autoSpaceDN`, on unless the paragraph or its style
+/// turns them off.
+pub(super) fn auto_space(
+    ppr: Option<roxmltree::Node>,
+    para_style: Option<&ParagraphStyle>,
+) -> (bool, bool) {
+    let flag = |name: &str, style: fn(&ParagraphStyle) -> Option<bool>| {
+        ppr.and_then(|ppr| wml_bool(ppr, name))
+            .or_else(|| para_style.and_then(style))
+            .unwrap_or(true)
+    };
+    (
+        flag("autoSpaceDE", |s| s.auto_space_de),
+        flag("autoSpaceDN", |s| s.auto_space_dn),
+    )
+}
+
+/// `w:textAlignment`, direct, from the style or the document defaults.
+pub(super) fn text_alignment(
+    ppr: Option<roxmltree::Node>,
+    para_style: Option<&ParagraphStyle>,
+    defaults: &StyleDefaults,
+) -> crate::model::TextAlignment {
+    ppr.and_then(|ppr| wml_attr(ppr, "textAlignment"))
+        .map(crate::model::TextAlignment::parse)
+        .or_else(|| para_style.and_then(|s| s.text_alignment))
+        .unwrap_or(defaults.text_alignment)
+}
+
+/// The paragraph's `w:shd` fill, direct or from the style. A direct `w:shd`
+/// wins even with fill="auto" (no fill). Shared by body and table-cell
+/// paragraphs.
+pub(super) fn shading(
+    ppr: Option<roxmltree::Node>,
+    para_style: Option<&ParagraphStyle>,
+) -> Option<[u8; 3]> {
+    match ppr.and_then(|ppr| wml(ppr, "shd")) {
+        Some(shd) => super::shd_color(shd),
+        None => para_style.and_then(|s| s.shading),
+    }
+}
+
+/// `w:contextualSpacing`, direct or from the style. Shared by body and
+/// table-cell paragraphs.
+pub(super) fn contextual_spacing(
+    ppr: Option<roxmltree::Node>,
+    para_style: Option<&ParagraphStyle>,
+) -> bool {
+    ppr.and_then(|ppr| wml_bool(ppr, "contextualSpacing"))
+        .unwrap_or_else(|| {
+            para_style
+                .and_then(|s| s.contextual_spacing)
+                .unwrap_or(false)
+        })
+}
+
+/// A paragraph's indents (left, right, hanging, first line) from its direct
+/// `w:ind`, its style and its numbering level, over the document defaults.
+/// Shared by body and table-cell paragraphs.
+/// One character for `*Chars` indents (`apply_indent_chars`), plus the
+/// section's character grid pitch (`ParseContext::grid_char_delta`), as
+/// (left/right, first line/hanging). Word online probes 2026-10-30 (issue
+/// #139): left and right count in the default paragraph style's size whatever
+/// the runs or the paragraph's style; first line and hanging in the first
+/// run's size (7pt runs under a 10.5pt Normal: leftChars=200 is 21pt,
+/// firstLineChars=200 is 14pt).
+pub(super) fn indent_char_widths(
+    runs: &[crate::model::Run],
+    para_style: Option<&ParagraphStyle>,
+    styles: &StylesInfo,
+    grid_char_delta: f32,
+) -> (f32, f32) {
+    let defaults = &styles.defaults;
+    let normal = styles
+        .paragraph_styles
+        .get(&styles.default_paragraph_style_id)
+        .and_then(|s| s.run.font_size)
+        .unwrap_or(defaults.font_size);
+    let first_run = runs.first().map(|r| r.font_size).unwrap_or_else(|| {
+        para_style
+            .and_then(|s| s.run.font_size)
+            .unwrap_or(defaults.font_size)
+    });
+    (normal + grid_char_delta, first_run + grid_char_delta)
+}
+
+pub(super) fn resolve_indents(
+    ppr: Option<roxmltree::Node>,
+    para_style: Option<&ParagraphStyle>,
+    numbering: &ListLabelInfo,
+    defaults: &StyleDefaults,
+) -> ((f32, f32, f32, f32), IndentChars) {
+    let mut indent_left = numbering.indent_left;
+    let mut indent_hanging = numbering.indent_hanging;
+    let mut indent_first_line = defaults.indent_first_line;
+    let mut indent_right = defaults.indent_right;
+    // Character units: a direct value replaces the style's; hanging and
+    // first line are one value here too. Resolved once the runs are known.
+    let direct_chars = ppr
+        .and_then(|ppr| wml(ppr, "ind"))
+        .map(extract_indent_chars)
+        .unwrap_or_default();
+    let style_chars = para_style.map(|s| s.indent_chars).unwrap_or_default();
+    let chars = IndentChars {
+        left: direct_chars.left.or(style_chars.left),
+        right: direct_chars.right.or(style_chars.right),
+        hanging: if direct_chars.hanging.is_some() || direct_chars.first_line.is_some() {
+            direct_chars.hanging
+        } else {
+            style_chars.hanging
+        },
+        first_line: if direct_chars.hanging.is_some() || direct_chars.first_line.is_some() {
+            direct_chars.first_line
+        } else {
+            style_chars.first_line
+        },
+    };
+    // Numbering-level ind (already in indent_left/indent_hanging) outranks
+    // style ind (§17.9.27); only directly-specified attributes override it.
+    // Numbering that comes from the paragraph style sits below an ind set on
+    // the same style or one below it (§17.7.2): an AC Bullet style setting
+    // 340/340 over its list level's 153/360 indents by 340 in Word; an ind
+    // only on a style above the numPr stays under the level's.
+    let style_ind_wins = ppr.and_then(|ppr| wml(ppr, "numPr")).is_none()
+        && para_style.is_some_and(|s| s.ind_over_numbering);
+    let numbering_ind = !style_ind_wins && (indent_left != 0.0 || indent_hanging != 0.0);
+    let (left, right, hanging, first) = if let Some(ind) = ppr.and_then(|ppr| wml(ppr, "ind")) {
+        let (l, r, h, f) = extract_indents(ind, None);
+        // firstLine and hanging are one value: a direct either replaces the
+        // style's both (indonesian's title, ind left=281 firstLine=0 over
+        // Heading1's hanging=543, starts at 281 in Word).
+        let first_hanging_direct = h.is_some() || f.is_some();
+        // Merge: inline w:ind attributes override style, but missing
+        // attributes fall back to the paragraph style values.
+        if let Some(s) = para_style {
+            if numbering_ind {
+                let f = if first_hanging_direct || numbering.indent_hanging != 0.0 {
+                    // A direct left/right alone does not replace the level's
+                    // hanging with the style's first-line indent.
+                    f
+                } else {
+                    s.indent_first_line
+                };
+                (l, r.or(s.indent_right), h, f)
+            } else if first_hanging_direct {
+                (l.or(s.indent_left), r.or(s.indent_right), h, f)
+            } else {
+                (
+                    l.or(s.indent_left),
+                    r.or(s.indent_right),
+                    s.indent_hanging,
+                    s.indent_first_line,
+                )
+            }
+        } else {
+            (l, r, h, f)
+        }
+    } else if (numbering.label.is_empty() || style_ind_wins)
+        && let Some(s) = para_style
+    {
+        (
+            s.indent_left,
+            s.indent_right,
+            s.indent_hanging,
+            s.indent_first_line,
+        )
+    } else {
+        (None, None, None, None)
+    };
+    if let Some(v) = left {
+        indent_left = v;
+    } else if indent_left == 0.0 {
+        indent_left = defaults.indent_left;
+    }
+    if let Some(v) = right {
+        indent_right = v;
+    }
+    if let Some(v) = hanging {
+        indent_hanging = v;
+    } else if first.is_some() {
+        indent_hanging = 0.0;
+    } else if indent_hanging == 0.0 {
+        indent_hanging = defaults.indent_hanging;
+    }
+    if let Some(v) = first {
+        indent_first_line = v;
+    } else if numbering_ind && hanging.is_none() && numbering.indent_hanging != 0.0 {
+        // firstLine and hanging are one value (§17.3.1.12): the level's hanging
+        // replaces an inherited first-line indent (CV's docDefaults firstLine=360
+        // under a 284/284 bullet level puts its label at the margin in Word).
+        indent_first_line = 0.0;
+    }
+    (
+        (indent_left, indent_right, indent_hanging, indent_first_line),
+        chars,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Run;
+
+    #[test]
+    fn list_level_hanging_survives_direct_left_or_right() {
+        for (ind, left, hanging, first) in [
+            (r#"w:left="1418""#, 70.9, 18.0, 0.0),
+            (r#"w:right="100""#, 98.95, 18.0, 0.0),
+            (r#"w:left="1418" w:firstLine="360""#, 70.9, 0.0, 18.0),
+            (r#"w:left="1418" w:firstLine="0""#, 70.9, 0.0, 0.0),
+            (r#"w:left="1418" w:hanging="284""#, 70.9, 14.2, 0.0),
+        ] {
+            let document = format!(
+                r#"<w:document xmlns:w="{WML_NS}"><w:body><w:p><w:pPr><w:pStyle w:val="List"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr><w:ind {ind}/></w:pPr><w:r><w:t>Public list item</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#
+            );
+            let styles = format!(
+                r#"<w:styles xmlns:w="{WML_NS}"><w:style w:type="paragraph" w:styleId="List"><w:name w:val="List"/><w:pPr><w:ind w:left="720" w:firstLine="360"/></w:pPr></w:style></w:styles>"#
+            );
+            let numbering = format!(
+                r#"<w:numbering xmlns:w="{WML_NS}"><w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:pPr><w:ind w:left="1979" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num></w:numbering>"#
+            );
+            let parsed = crate::docx::parse_parts(&[
+                ("word/document.xml", &document),
+                ("word/styles.xml", &styles),
+                ("word/numbering.xml", &numbering),
+            ]);
+            let crate::model::Block::Paragraph(p) = &parsed.sections[0].blocks[0] else {
+                panic!("expected a paragraph");
+            };
+            assert!((p.indent_left - left).abs() < 0.001, "{ind}");
+            assert!((p.indent_hanging - hanging).abs() < 0.001, "{ind}");
+            assert!((p.indent_first_line - first).abs() < 0.001, "{ind}");
+        }
+    }
+
+    /// Word online probe 2026-11-13 (kit named in roadmap.md): every gap
+    /// below matched Word's PDF within 0.02pt.
+    #[test]
+    fn spacing_lines_beat_twips_unless_zero() {
+        let p = |spacing: &str, style: &str| {
+            format!(
+                r#"<w:p><w:pPr>{style}<w:spacing {spacing}/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#
+            )
+        };
+        let lines_style = r#"<w:pStyle w:val="Lines"/>"#;
+        let body = [
+            p(r#"w:beforeLines="100" w:before="0""#, ""),
+            p(r#"w:beforeLines="0" w:before="240""#, ""),
+            p(r#"w:beforeLines="50" w:before="600""#, ""),
+            p(r#"w:afterLines="100" w:after="0""#, ""),
+            p(r#"w:before="480""#, lines_style),
+            p(r#"w:beforeLines="0" w:before="480""#, lines_style),
+        ]
+        .concat();
+        let grid_body = p(r#"w:beforeLines="250" w:before="0""#, "");
+        let document = format!(
+            r#"<w:document xmlns:w="{WML_NS}"><w:body>{body}<w:p><w:pPr><w:sectPr><w:docGrid w:linePitch="360"/></w:sectPr></w:pPr></w:p>{grid_body}<w:sectPr><w:docGrid w:type="lines" w:linePitch="400"/></w:sectPr></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles xmlns:w="{WML_NS}"><w:style w:type="paragraph" w:styleId="Lines"><w:name w:val="Lines"/><w:pPr><w:spacing w:beforeLines="100" w:before="0"/></w:pPr></w:style></w:styles>"#
+        );
+        let parsed = crate::docx::parse_parts(&[
+            ("word/document.xml", &document),
+            ("word/styles.xml", &styles),
+        ]);
+        let paras: Vec<_> = parsed
+            .sections
+            .iter()
+            .flat_map(|s| &s.blocks)
+            .filter_map(|b| match b {
+                crate::model::Block::Paragraph(p) if p.runs.iter().any(|r| r.text == "x") => {
+                    Some(p)
+                }
+                _ => None,
+            })
+            .collect();
+        let before: Vec<f32> = paras.iter().map(|p| p.space_before).collect();
+        assert_eq!(before, [12.0, 12.0, 6.0, 0.0, 12.0, 24.0, 50.0]);
+        assert_eq!(paras[3].space_after, 12.0);
+    }
+
+    /// A header's `*Lines` count in its section's grid pitch, as the body's do.
+    #[test]
+    fn header_spacing_lines_use_the_section_grid() {
+        let document = format!(
+            r#"<w:document xmlns:w="{WML_NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p/><w:sectPr><w:headerReference w:type="default" r:id="rIdHdr"/><w:docGrid w:type="lines" w:linePitch="400"/></w:sectPr></w:body></w:document>"#
+        );
+        let header = format!(
+            r#"<w:hdr xmlns:w="{WML_NS}"><w:p><w:pPr><w:spacing w:beforeLines="50" w:before="0"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p></w:hdr>"#
+        );
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHdr" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/></Relationships>"#;
+        let parsed = crate::docx::parse_parts(&[
+            ("word/document.xml", document.as_str()),
+            ("word/header1.xml", header.as_str()),
+            ("word/_rels/document.xml.rels", rels),
+        ]);
+        let header = parsed.sections[0]
+            .properties
+            .header_default
+            .as_ref()
+            .unwrap();
+        let crate::model::Block::Paragraph(p) = &header.blocks[0] else {
+            panic!("expected a paragraph");
+        };
+        assert_eq!(p.space_before, 10.0);
+    }
+
+    #[test]
+    fn cell_paragraphs_take_style_shading_unless_direct_shd_clears_it() {
+        let cell_para = |ppr: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="Bar"/>{ppr}</w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#
+            )
+        };
+        let document = format!(
+            r#"<w:document xmlns:w="{WML_NS}"><w:body><w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid><w:tr><w:tc>{}{}</w:tc></w:tr></w:tbl><w:sectPr/></w:body></w:document>"#,
+            cell_para(""),
+            cell_para(r#"<w:shd w:val="clear" w:color="auto" w:fill="auto"/>"#),
+        );
+        let styles = format!(
+            r#"<w:styles xmlns:w="{WML_NS}"><w:style w:type="paragraph" w:styleId="Bar"><w:name w:val="Bar"/><w:pPr><w:shd w:val="clear" w:color="auto" w:fill="00B0F0"/></w:pPr></w:style></w:styles>"#
+        );
+        let parsed = crate::docx::parse_parts(&[
+            ("word/document.xml", &document),
+            ("word/styles.xml", &styles),
+        ]);
+        let crate::model::Block::Table(t) = &parsed.sections[0].blocks[0] else {
+            panic!("expected a table");
+        };
+        let shading: Vec<_> = t.rows[0].cells[0]
+            .content
+            .iter()
+            .map(|b| match b {
+                crate::model::Block::Paragraph(p) => p.shading,
+                _ => panic!("expected paragraphs"),
+            })
+            .collect();
+        assert_eq!(shading, [Some([0x00, 0xB0, 0xF0]), None]);
+    }
+
+    #[test]
+    fn hanging_indent_adds_one_stop_at_the_indent() {
+        let mut stops = Vec::new();
+        add_hanging_tab_stop(&mut stops, 28.35, 28.35);
+        add_hanging_tab_stop(&mut stops, 28.35, 28.35);
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].position, 28.35);
+        add_hanging_tab_stop(&mut stops, 50.0, 0.0);
+        assert_eq!(stops.len(), 1);
+    }
+
+    #[test]
+    fn paragraph_mark_inherits_character_style_with_direct_overrides() {
+        for (mark, font, size) in [
+            (r#"<w:rStyle w:val="Child"/>"#, "Times New Roman", 11.0),
+            (
+                r#"<w:rStyle w:val="Child"/><w:sz w:val="28"/>"#,
+                "Times New Roman",
+                14.0,
+            ),
+            (
+                r#"<w:rStyle w:val="Child"/><w:rFonts w:ascii="Arial"/>"#,
+                "Arial",
+                11.0,
+            ),
+            (r#"<w:rStyle w:val="Missing"/>"#, "Calibri", 12.0),
+        ] {
+            let document = format!(
+                r#"<w:document xmlns:w="{WML_NS}"><w:body><w:p><w:pPr><w:rPr>{mark}</w:rPr></w:pPr></w:p><w:sectPr/></w:body></w:document>"#
+            );
+            let styles = format!(
+                r#"<w:styles xmlns:w="{WML_NS}"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri"/><w:sz w:val="24"/></w:rPr></w:rPrDefault></w:docDefaults><w:style w:type="character" w:styleId="Base"><w:name w:val="Base"/><w:rPr><w:rFonts w:ascii="Times New Roman"/><w:sz w:val="22"/></w:rPr></w:style><w:style w:type="character" w:styleId="Child"><w:name w:val="Child"/><w:basedOn w:val="Base"/></w:style></w:styles>"#
+            );
+            let parsed = crate::docx::parse_parts(&[
+                ("word/document.xml", &document),
+                ("word/styles.xml", &styles),
+            ]);
+            let crate::model::Block::Paragraph(para) = &parsed.sections[0].blocks[0] else {
+                panic!("expected a paragraph");
+            };
+            assert_eq!(para.paragraph_mark_font_name.as_deref(), Some(font));
+            assert_eq!(para.paragraph_mark_font_size, Some(size));
+            assert_eq!(para.runs[0].font_name, font);
+            assert_eq!(para.runs[0].font_size, size);
+        }
+    }
+
+    #[test]
+    fn rtl_and_cs_runs_take_the_complex_script_formatting() {
+        let rpr = r#"<w:rFonts w:ascii="Courier New" w:cs="Times New Roman"/><w:b/><w:sz w:val="24"/><w:szCs w:val="40"/>"#;
+        let document = format!(
+            r#"<w:document xmlns:w="{WML_NS}"><w:body><w:p><w:pPr><w:pStyle w:val="Rtl"/></w:pPr><w:r><w:rPr>{rpr}</w:rPr><w:t>plain</w:t></w:r><w:r><w:rPr>{rpr}<w:rtl/></w:rPr><w:t>rtl</w:t></w:r><w:r><w:rPr>{rpr}<w:iCs/><w:cs/></w:rPr><w:t>cs</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Sub"/></w:pPr><w:r><w:rPr><w:rtl/></w:rPr><w:t>sub</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles xmlns:w="{WML_NS}"><w:style w:type="paragraph" w:styleId="Rtl"><w:name w:val="Rtl"/><w:pPr><w:bidi/></w:pPr><w:rPr><w:bCs/><w:szCs w:val="30"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Sub"><w:name w:val="Sub"/><w:basedOn w:val="Rtl"/></w:style></w:styles>"#
+        );
+        let parsed = crate::docx::parse_parts(&[
+            ("word/document.xml", &document),
+            ("word/styles.xml", &styles),
+        ]);
+        let crate::model::Block::Paragraph(para) = &parsed.sections[0].blocks[0] else {
+            panic!("expected a paragraph");
+        };
+        assert!(para.bidi);
+        let props = |r: &Run| (r.font_name.clone(), r.font_size, r.bold, r.italic, r.rtl);
+        let font = |f: &str| f.to_string();
+        assert_eq!(
+            props(&para.runs[0]),
+            (font("Courier New"), 12.0, true, false, false)
+        );
+        // The style's bCs reaches both; w:b does not.
+        assert_eq!(
+            props(&para.runs[1]),
+            (font("Times New Roman"), 20.0, true, false, true)
+        );
+        assert_eq!(
+            props(&para.runs[2]),
+            (font("Times New Roman"), 20.0, true, true, false)
+        );
+        // basedOn passes the complex-script properties (and w:bidi) down.
+        let crate::model::Block::Paragraph(sub) = &parsed.sections[0].blocks[1] else {
+            panic!("expected a paragraph");
+        };
+        assert!(sub.bidi);
+        assert_eq!((sub.runs[0].font_size, sub.runs[0].bold), (15.0, true));
+    }
+
+    #[test]
+    fn column_break_split_starts_the_continuation_in_the_next_column() {
+        let run = |t: &str| Run {
+            text: t.into(),
+            ..Run::default()
+        };
+        let mut para = Paragraph {
+            runs: vec![run("before"), run("after")],
+            page_break_at: Some(1),
+            column_break_after: true,
+            ..Paragraph::default()
+        };
+        let rest = split_at_page_break(&mut para).unwrap();
+        assert!(!para.column_break_after && !para.page_break_after);
+        assert!(rest.column_break_before && rest.runs[0].text == "after");
+    }
+
+    #[test]
+    fn page_break_split_moves_the_paragraph_end_to_the_continuation() {
+        let run = |t: &str| Run {
+            text: t.into(),
+            ..Run::default()
+        };
+        let mut para = Paragraph {
+            runs: vec![run("before"), run("after")],
+            page_break_at: Some(1),
+            page_break_after: true,
+            space_before: 6.0,
+            space_after: 10.0,
+            keep_next: true,
+            indent_left: 18.0,
+            indent_hanging: 18.0,
+            list_label: "1.".into(),
+            ..Paragraph::default()
+        };
+        let rest = split_at_page_break(&mut para).unwrap();
+        assert_eq!(para.runs.len(), 1);
+        assert_eq!(rest.runs[0].text, "after");
+        assert!(para.page_break_after && !para.keep_next && para.space_after == 0.0);
+        assert!(rest.keep_next && rest.space_after == 10.0 && rest.space_before == 0.0);
+        assert_eq!((rest.indent_left, rest.indent_hanging), (18.0, 0.0));
+        assert!(rest.list_label.is_empty() && !rest.page_break_after);
+        assert!(split_at_page_break(&mut para).is_none());
+    }
+
+    #[test]
+    fn a_pstyle_naming_a_character_style_falls_back_to_normal() {
+        let document = format!(
+            r#"<w:document xmlns:w="{WML_NS}"><w:body><w:p><w:pPr><w:pStyle w:val="BodyChar"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Missing"/></w:pPr></w:p><w:sectPr/></w:body></w:document>"#
+        );
+        let styles = format!(
+            r#"<w:styles xmlns:w="{WML_NS}"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="259" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="18"/></w:rPr></w:style><w:style w:type="character" w:styleId="BodyChar"><w:name w:val="Body Char"/><w:rPr><w:sz w:val="40"/></w:rPr></w:style></w:styles>"#
+        );
+        let parsed = crate::docx::parse_parts(&[
+            ("word/document.xml", &document),
+            ("word/styles.xml", &styles),
+        ]);
+        for block in &parsed.sections[0].blocks[..2] {
+            let crate::model::Block::Paragraph(para) = block else {
+                panic!("expected a paragraph");
+            };
+            assert_eq!(para.space_after, 0.0);
+            assert!(
+                matches!(para.line_spacing, Some(crate::model::LineSpacing::Auto(m)) if m == 1.0)
+            );
+            assert_eq!(para.paragraph_mark_font_size, Some(9.0));
+            assert_eq!(para.paragraph_mark_font_name.as_deref(), Some("Arial"));
+            assert_eq!(para.style_id.as_deref(), Some("Normal"));
+        }
+        let crate::model::Block::Paragraph(para) = &parsed.sections[0].blocks[0] else {
+            panic!("expected a paragraph");
+        };
+        assert_eq!(
+            (para.runs[0].font_name.as_str(), para.runs[0].font_size),
+            ("Arial", 9.0)
+        );
+    }
+}

@@ -1,0 +1,2369 @@
+use std::collections::HashMap;
+
+use super::canvas::Content;
+use pdf_writer::{Name, Str};
+
+use crate::fonts::FontEntry;
+use crate::model::{
+    Alignment, Block, CellMargins, CellVAlign, Paragraph, SectionProperties, Table, TableAlignment,
+    TableRow, TextDirection, VMerge,
+};
+
+use super::cell_draw::{
+    beside_float_geometry, cell_label_alignment_offset, clip_fixed_cell_pictures, draw_border,
+    draw_cell_borders, draw_cell_float, draw_cell_label, draw_cell_paragraph_bottom,
+    draw_cell_paragraph_shading, draw_cell_shading, render_cell_inline_image,
+    render_simple_textbox, valign_offset,
+};
+use super::color::fill_rgb;
+use super::header_footer::effective_slot_top;
+
+use super::RenderContext;
+use super::layout::{
+    LinkAnnotation, LinkTagger, RenderOpts, encode_text_for_pdf, render_paragraph_lines,
+};
+use super::table_columns::{
+    apply_pct_width, auto_fit_columns, autofit_min_widths, cell_span_width, cell_x_offset,
+    fixed_columns, min_content_widths, squeeze_to_width,
+};
+use super::table_layout::{
+    CellContentItem, CellFloatingImageLayout, CellLayout, CellParagraphLayout, HfSubstitution,
+    RowLayout, compute_row_layouts, keep_chain_end, para_block_height,
+};
+use super::table_split::{
+    CELL_START, CellCursor, Chunk, RowPiece, chunk_space_before, compute_merge_spans,
+    continues_whole, cursor_chunks, find_cell_split, item_chunk_height, partial_row_height,
+    row_pieces, skip_finished_row,
+};
+use super::tagging::{CellTagger, TableTags, Tags};
+
+/// The page's behind-text layer when a table draws into the body: its cells'
+/// behind-text drawings go there instead of in place.
+type BehindLayer<'a> = Option<&'a mut Vec<(u32, Content)>>;
+
+fn para_has_visible_content(para: &CellParagraphLayout) -> bool {
+    !para.list_label.is_empty()
+        || para.lines.iter().any(|l| !l.is_blank())
+        || !para.floating_images.is_empty()
+        || para.image_name.is_some()
+        || para.has_textboxes
+        || para.has_connectors
+}
+
+/// Total content height including trailing space_after, matching Word's vAlign calculation.
+fn cell_content_h_for_valign(items: &[CellContentItem]) -> f32 {
+    let mut h: f32 = 0.0;
+    let mut floating_extent: f32 = 0.0;
+    for item in items {
+        match item {
+            CellContentItem::Paragraph(p) => {
+                h += p.space_before;
+                // Anchored pictures do not enlarge an automatic row, but Word
+                // includes their lower edge when distributing vAlign space.
+                for fi in &p.floating_images {
+                    floating_extent = floating_extent.max(h + fi.v_offset + fi.display_height);
+                }
+                h += para_block_height(p);
+            }
+            nested @ CellContentItem::NestedTable { .. } => h += nested.height(),
+        }
+    }
+    // Word includes the last paragraph's space_after in the content block height
+    // used for vertical alignment, so bottom/center-aligned cells position correctly.
+    if let Some(CellContentItem::Paragraph(last_para)) = items.last() {
+        h += last_para.space_after;
+        // Baselines sit at a fixed font_size below each line's top, so a font
+        // whose line height exceeds font_size + descent leaves its extra
+        // leading dangling below the ink of the last line. Only compensate
+        // when the font is a metric-changing fallback (e.g. a CJK substitute
+        // with a large lineGap): there the dangling leading is our artifact,
+        // whereas with the document's real font the full line box matches
+        // Word's own centering.
+        if last_para.font_substituted
+            && (!last_para.lines.is_empty()
+                || (last_para.content_height <= 0.0 && !last_para.paragraph_mark_vanish))
+        {
+            let ink_bottom = last_para.font_size * (1.0 + last_para.descender_ratio);
+            h -= (last_para.line_h - ink_bottom).max(0.0);
+        }
+    }
+    h.max(floating_extent)
+}
+
+fn cell_has_visible_content<'a>(items: impl IntoIterator<Item = &'a CellContentItem>) -> bool {
+    items.into_iter().any(|item| match item {
+        CellContentItem::Paragraph(p) => para_has_visible_content(p),
+        CellContentItem::NestedTable { rows, .. } => rows.iter().any(|r| r.height > 0.0),
+    })
+}
+
+/// Column span to tag a cell with. A row that starts late (`w:gridBefore`)
+/// lends the skipped columns to its first cell and one that stops short
+/// (`w:gridAfter`) the rest to its last cell, so every TR spans the table's
+/// columns (PDF/UA 7.2-42/43).
+fn row_tag_span(
+    row: &TableRow,
+    ci: usize,
+    span: usize,
+    grid_cols: usize,
+    grid_col_after: usize,
+) -> i32 {
+    let lead = if ci == 0 { row.grid_before } else { 0 };
+    let span = if ci + 1 == row.cells.len() {
+        span + grid_cols.saturating_sub(grid_col_after)
+    } else {
+        span
+    };
+    (lead + span) as i32
+}
+
+/// The list label of a tagged cell list item goes in its Lbl, the rest of the
+/// paragraph in its LBody.
+fn draw_tagged_cell_label(
+    content: &mut Content,
+    tagger: &mut Option<CellTagger<'_>>,
+    nodes: Option<(Option<usize>, usize)>,
+    para: &CellParagraphLayout,
+    label_x: f32,
+    baseline_y: f32,
+    fonts: &HashMap<String, FontEntry>,
+) {
+    match (tagger.as_mut(), nodes) {
+        (Some(t), Some((Some(label), body))) => {
+            t.switch(content, label);
+            draw_cell_label(content, para, label_x, baseline_y, fonts);
+            t.switch(content, body);
+        }
+        _ => draw_cell_label(content, para, label_x, baseline_y, fonts),
+    }
+}
+
+/// Links and footnote references in a tagged cell paragraph nest in its P.
+fn cell_link_tagger<'a>(
+    tagger: &'a mut Option<CellTagger<'_>>,
+    para: Option<usize>,
+) -> Option<LinkTagger<'a>> {
+    let t = tagger.as_mut()?;
+    Some(LinkTagger::new(&mut *t.tags, t.page, para?))
+}
+
+fn end_cell_tag(content: &mut Content, tagger: &Option<CellTagger<'_>>) {
+    if tagger.is_some() {
+        Tags::end(content);
+    }
+}
+
+/// The content of a cell from `start` to `end`. `whole` cells also draw
+/// their anchored shapes, layer their pictures by relativeHeight and clip
+/// their text to the cell's edges; a split row's pieces never did.
+fn render_cell_content(
+    content: &mut Content,
+    items: &[CellContentItem],
+    // The cell's source blocks: compute_row_layouts lays out one item per
+    // block, so item `i` came from block `i`.
+    blocks: &[Block],
+    start: &CellCursor,
+    end: &CellCursor,
+    cell_x: f32,
+    col_w: f32,
+    cursor_y_start: f32,
+    // vAlign centering shift already folded into cursor_y_start. Word anchors
+    // paragraph-relative floats to the cell's content top, unaffected by the
+    // vAlign redistribution, so float anchors add this back.
+    valign_off: f32,
+    cm: &CellMargins,
+    ctx: &RenderContext,
+    gradient_specs: &mut Vec<super::GradientSpec>,
+    links: &mut Vec<LinkAnnotation>,
+    mut tagger: Option<CellTagger<'_>>,
+    hf_sub: Option<&HfSubstitution>,
+    mut behind: BehindLayer<'_>,
+    floor: f32,
+    whole: bool,
+) {
+    let mut cursor_y = cursor_y_start;
+    let mut reanchor_shift = 0.0;
+    // Word clips cell text at the cell's horizontal edges, even when a
+    // negative paragraph indent puts a glyph outside it. Keep this around
+    // inline text/labels only: anchored shapes and nested floating tables
+    // have their own drawing bounds.
+    let page_h = ctx
+        .sections
+        .iter()
+        .map(|s| s.properties.page_height)
+        .fold(cursor_y_start.max(0.0), f32::max);
+
+    for chunk in cursor_chunks(items, start, end) {
+        let (pi, l0, l1) = (chunk.item, chunk.l0, chunk.l1);
+        match &items[pi] {
+            CellContentItem::Paragraph(para) => {
+                let source_para = match blocks.get(pi) {
+                    Some(Block::Paragraph(p)) => Some(p),
+                    _ => None,
+                };
+                let sb = chunk_space_before(&items[pi], pi, start);
+
+                // Word tags every cell paragraph, empty ones included.
+                let cell_nodes = tagger.as_mut().map(|t| {
+                    let labelled = !para.list_label.is_empty();
+                    t.begin(content, pi, para.list_item, labelled, para.tag_kind())
+                });
+                let cell_para = cell_nodes.map(|(_, body)| body);
+                let para_top = cursor_y;
+                if let Some(src) = source_para {
+                    let h = if para.lines.is_empty() {
+                        para_block_height(para)
+                    } else {
+                        let l1 = l1.unwrap_or(para.lines.len());
+                        super::table_layout::cell_lines_h(para, l0..l1)
+                    };
+                    draw_cell_paragraph_shading(content, src, cell_x, col_w, cm, cursor_y - sb, h);
+                }
+                if !para_has_visible_content(para) {
+                    cursor_y -= sb + para_block_height(para);
+                    // A VML horizontal rule (o:hr) rides an otherwise empty
+                    // paragraph, in cells as in the body (advocacy's story
+                    // separators).
+                    if whole
+                        && let Some(p) = source_para
+                        && let Some(hr) = &p.horizontal_rule
+                    {
+                        super::helpers::draw_horizontal_rule(
+                            content,
+                            p,
+                            hr,
+                            cell_x + cm.left,
+                            col_w - cm.left - cm.right,
+                            cursor_y,
+                        );
+                    }
+                    draw_cell_paragraph_bottom(content, para, cell_x, col_w, cm, cursor_y);
+                    end_cell_tag(content, &tagger);
+                    continue;
+                }
+
+                cursor_y -= sb;
+                // Word anchors paragraph-relative floats to the cell's content
+                // top, unaffected by vAlign (see `valign_off`).
+                let float_y = cursor_y + valign_off;
+
+                // Word stacks anchored objects by relativeHeight: a picture
+                // above the paragraph's connectors/textboxes must paint after
+                // them (annotation #241: an opaque label cutting a vertical
+                // arrow). Everything else keeps the picture-before-text order.
+                let shape_z = source_para.filter(|_| whole).and_then(|p| {
+                    p.connectors
+                        .iter()
+                        .map(|c| c.z_index)
+                        .chain(p.textboxes.iter().map(|t| t.z_index))
+                        .max()
+                });
+                let layered = whole && behind.is_some();
+                let above_shapes = |fi: &&CellFloatingImageLayout| {
+                    !(layered && fi.behind_doc) && shape_z.is_some_and(|z| fi.z_index > z)
+                };
+                // Anchored pictures and the list label belong to the
+                // paragraph's first line; a continuation chunk has neither.
+                if l0 == 0 {
+                    // Tag the behind layer first, preserving the cell's reading
+                    // order even when a front picture comes first in the paragraph.
+                    let behind_floats = para
+                        .floating_images
+                        .iter()
+                        .filter(|fi| layered && fi.behind_doc);
+                    let front_floats = para
+                        .floating_images
+                        .iter()
+                        .filter(|fi| !(layered && fi.behind_doc) && !above_shapes(fi));
+                    for fi in behind_floats.chain(front_floats) {
+                        place_cell_float(
+                            content,
+                            &mut behind,
+                            &mut tagger,
+                            cell_para,
+                            fi,
+                            cell_x,
+                            float_y,
+                        );
+                    }
+                }
+
+                if let Some(ref img_name) = para.image_name {
+                    for fi in para.floating_images.iter().filter(above_shapes) {
+                        cell_figure(content, &mut tagger, cell_para, fi.tagging(), |c| {
+                            draw_cell_float(c, fi, cell_x, float_y)
+                        });
+                    }
+                    // distT/distB in layout_extra_height contribute to row
+                    // height but don't add spacing between image and text.
+                    // The paragraph's P stays empty and the picture follows
+                    // it as a Figure, as in the body.
+                    let picture = (para.image_alt.as_deref(), para.image_decorative);
+                    cursor_y -= cell_figure(content, &mut tagger, None, picture, |c| {
+                        render_cell_inline_image(c, para, img_name, cell_x, col_w, cursor_y, cm)
+                    });
+                    cursor_y -= para.bottom_band.1;
+                    draw_cell_paragraph_bottom(content, para, cell_x, col_w, cm, cursor_y);
+                    continue;
+                }
+
+                if whole {
+                    content.save_state();
+                    content
+                        .rect(cell_x, 0.0, col_w, page_h)
+                        .clip_nonzero()
+                        .end_path();
+                }
+                let text_x = cell_x + cm.left + para.indent_left + para.float_indent_left;
+                // Must match the wrap width in table_layout.rs (incl. indent_right),
+                // or centered text shifts right and justify overshoots the border.
+                let text_w = (col_w
+                    - cm.left
+                    - cm.right
+                    - para.indent_left
+                    - para.indent_right
+                    - para.float_indent_left)
+                    .max(0.0);
+                let baseline_y = cursor_y - para.font_size * para.ascender_ratio;
+                if l0 == 0 && !para.list_label.is_empty() {
+                    let label_x = cell_x + cm.left + para.indent_left - para.indent_hanging
+                        + para.indent_first_line
+                        + cell_label_alignment_offset(para, col_w - cm.left - cm.right);
+                    draw_tagged_cell_label(
+                        content,
+                        &mut tagger,
+                        cell_nodes,
+                        para,
+                        label_x,
+                        baseline_y,
+                        ctx.fonts,
+                    );
+                }
+
+                let l1 = l1.unwrap_or(para.lines.len());
+                let lines_h = super::table_layout::cell_lines_h(para, l0..l1);
+                let picture_clip =
+                    clip_fixed_cell_pictures(content, para, cell_x, col_w, cursor_y, lines_h);
+                render_paragraph_lines(
+                    content,
+                    &para.lines[l0..l1],
+                    &para.alignment,
+                    text_x,
+                    para.indent_left,
+                    text_w,
+                    baseline_y,
+                    para.line_h,
+                    para.picture_metrics(),
+                    para.lines.len(),
+                    links,
+                    para.text_hanging,
+                    ctx.fonts,
+                    gradient_specs,
+                    RenderOpts {
+                        first_line_index: l0,
+                        line_geometry: beside_float_geometry(para, text_x, text_w).as_deref(),
+                        comment_anchors: Some(&mut ctx.cell_comment_anchors.borrow_mut()),
+                        link_tags: cell_link_tagger(&mut tagger, cell_para),
+                        line_grid: para.line_grid.map(|g| super::layout::LineGrid {
+                            page_height: ctx.page_height.get(),
+                            ..g
+                        }),
+                        ..Default::default()
+                    },
+                );
+                if picture_clip {
+                    content.restore_state();
+                }
+                if whole {
+                    content.restore_state();
+                }
+                end_cell_tag(content, &tagger);
+
+                cursor_y -= if para.lines.is_empty() {
+                    para_block_height(para)
+                } else {
+                    lines_h
+                };
+                if l1 == para.lines.len() {
+                    draw_cell_paragraph_bottom(content, para, cell_x, col_w, cm, cursor_y);
+                }
+
+                if whole && let Some(src) = source_para {
+                    render_cell_floating_shapes(
+                        content,
+                        src,
+                        cell_x,
+                        col_w,
+                        cm.left,
+                        para_top + valign_off,
+                        ctx,
+                        gradient_specs,
+                        links,
+                        &mut tagger,
+                        hf_sub,
+                        behind.as_deref_mut(),
+                    );
+                }
+                for fi in para.floating_images.iter().filter(above_shapes) {
+                    cell_figure(content, &mut tagger, None, fi.tagging(), |c| {
+                        draw_cell_float(c, fi, cell_x, float_y)
+                    });
+                }
+            }
+            CellContentItem::NestedTable {
+                col_widths,
+                rows,
+                space_before,
+                floating_offset,
+                floating_x_offset,
+                bottom_band,
+            } => {
+                if let Some(Block::Table(table)) = blocks.get(pi) {
+                    let saved_y = cursor_y;
+                    let drop_anchor = continues_whole(&chunk, start);
+                    if chunk.l0 == 0 && chunk.from.is_empty() {
+                        let gap = if let Some(offset) = floating_offset {
+                            super::table_split::floating_anchor_gap(
+                                *space_before,
+                                *offset,
+                                floating_x_offset.is_some(),
+                                drop_anchor,
+                                &mut reanchor_shift,
+                            )
+                        } else if drop_anchor {
+                            0.0
+                        } else {
+                            *space_before
+                        };
+                        cursor_y -= gap;
+                    }
+                    render_nested_table(
+                        table,
+                        content,
+                        cell_x
+                            + cm.left
+                            + if drop_anchor {
+                                0.0
+                            } else {
+                                floating_x_offset.unwrap_or(0.0)
+                            },
+                        col_w - cm.left - cm.right,
+                        floating_offset.map(|_| cm),
+                        &mut cursor_y,
+                        ctx,
+                        gradient_specs,
+                        links,
+                        &mut tagger,
+                        (col_widths, rows),
+                        &chunk,
+                        behind.as_deref_mut(),
+                        floor,
+                    );
+                    if floating_offset.is_some() {
+                        cursor_y = saved_y;
+                    } else if chunk.l1.is_none() && chunk.to.is_empty() {
+                        cursor_y -= bottom_band;
+                    }
+                } else {
+                    cursor_y -= item_chunk_height(&items[pi], &chunk, start, cursor_y - floor);
+                }
+            }
+        }
+    }
+}
+
+/// Draw a picture in a cell as a Figure inside the cell element, as Word tags
+/// one (an artifact when decorative), then go back into the cell paragraph
+/// `resume` while it is still open.
+fn cell_figure<R>(
+    content: &mut Content,
+    tagger: &mut Option<CellTagger<'_>>,
+    resume: Option<usize>,
+    (alt, decorative): (Option<&str>, bool),
+    draw: impl FnOnce(&mut Content) -> R,
+) -> R {
+    let Some(t) = tagger.as_mut() else {
+        return draw(content);
+    };
+    if decorative {
+        Tags::end(content);
+    } else {
+        let figure = t.figure(alt);
+        t.switch(content, figure);
+    }
+    let drawn = draw(content);
+    match resume {
+        Some(para) => t.switch(content, para),
+        None => Tags::end(content),
+    }
+    drawn
+}
+
+/// A picture floating in a cell: a behind-text one drawn on its own for the
+/// page's behind-text layer, any other in place.
+fn place_cell_float(
+    content: &mut Content,
+    behind: &mut BehindLayer<'_>,
+    tagger: &mut Option<CellTagger<'_>>,
+    cell_para: Option<usize>,
+    fi: &CellFloatingImageLayout,
+    cell_x: f32,
+    para_y: f32,
+) {
+    let draw = |c: &mut Content| draw_cell_float(c, fi, cell_x, para_y);
+    match behind.as_deref_mut().filter(|_| fi.behind_doc) {
+        Some(layer) => {
+            let mut shape = super::tagging::artifact_content();
+            cell_figure(&mut shape, tagger, None, fi.tagging(), draw);
+            layer.push((fi.z_index, shape));
+        }
+        None => cell_figure(content, tagger, cell_para, fi.tagging(), draw),
+    }
+}
+
+/// Render floating textboxes and connectors anchored to a cell paragraph.
+fn render_cell_floating_shapes(
+    content: &mut Content,
+    para: &Paragraph,
+    cell_x: f32,
+    col_w: f32,
+    text_inset: f32,
+    para_top: f32,
+    ctx: &RenderContext,
+    gradient_specs: &mut Vec<super::GradientSpec>,
+    links: &mut Vec<LinkAnnotation>,
+    tagger: &mut Option<CellTagger<'_>>,
+    hf_sub: Option<&HfSubstitution>,
+    mut behind: BehindLayer<'_>,
+) {
+    use super::positioning::render_connector;
+
+    // Positioned relative to the cell column origin and paragraph top.
+    for conn in &para.connectors {
+        let x = conn.h_position.place(cell_x, col_w, conn.width);
+        render_connector(
+            conn,
+            content,
+            x,
+            para_top - conn.v_position.offset_or_zero(),
+        );
+    }
+
+    for tb in &para.textboxes {
+        // An offset counts from where the cell's text starts, not its edge
+        // (table probe 7, compat 14 and 15: a 6pt offset lands 6pt right of
+        // the text for every margin and border width).
+        let h_off = match tb.h_position {
+            crate::model::HorizontalPosition::Offset(o) => text_inset + o,
+            p => p.place(0.0, col_w, tb.width_pt),
+        };
+        let tb_x = cell_x + h_off;
+        let tb_y_top = para_top - tb.v_offset_pt;
+        let layer = behind.as_deref_mut().filter(|_| tb.behind_doc);
+        let mut shape = layer.is_some().then(super::tagging::artifact_content);
+        render_simple_textbox(
+            shape.as_mut().unwrap_or(&mut *content),
+            tb,
+            tb_x,
+            tb_y_top,
+            ctx,
+            gradient_specs,
+            links,
+            tagger.as_mut(),
+            hf_sub,
+        );
+        if let Some((layer, shape)) = layer.zip(shape) {
+            layer.push((tb.z_index, shape));
+        }
+    }
+}
+
+/// Render a nested table inline within a parent cell at the given cursor position.
+/// Render every row of `table` — cell backgrounds and content, then borders —
+/// advancing `cursor_y`. Shared by nested and header/footer table rendering.
+/// The tagger of cell `ci` (grid column `grid_col`, `span` wide) of `row`,
+/// when the table is tagged.
+fn cell_tagger<'a>(
+    tag: Option<(&'a mut Tags, &'a mut TableTags, usize)>,
+    row: &TableRow,
+    row_idx: usize,
+    ci: usize,
+    span: usize,
+    col_widths: &[f32],
+    grid_col: usize,
+) -> Option<CellTagger<'a>> {
+    tag.map(|(tags, table, page)| CellTagger {
+        tags,
+        table,
+        page,
+        row: row_idx,
+        cell: ci,
+        col_span: row_tag_span(row, ci, span, col_widths.len(), grid_col + span),
+    })
+}
+
+/// A cell's content from its top margin down, shifted for vAlign; an empty
+/// cell still gets its tagged empty paragraph.
+fn render_cell_box(
+    content: &mut Content,
+    cell: &crate::model::TableCell,
+    cell_layout: &CellLayout,
+    cell_x: f32,
+    row_top: f32,
+    effective_h: f32,
+    col_w: f32,
+    ctx: &RenderContext,
+    gradient_specs: &mut Vec<super::GradientSpec>,
+    links: &mut Vec<LinkAnnotation>,
+    tagger: Option<CellTagger<'_>>,
+    hf_sub: Option<&HfSubstitution>,
+    behind: BehindLayer<'_>,
+) {
+    if cell_has_visible_content(&cell_layout.items) {
+        let ecm = &cell_layout.cm;
+        let content_h = cell_content_h_for_valign(&cell_layout.items);
+        let avail = effective_h - ecm.top - ecm.bottom;
+        let v_offset = valign_offset(cell.v_align, avail, content_h);
+        let cell_cursor_y = row_top - ecm.top - v_offset;
+        render_cell_content(
+            content,
+            &cell_layout.items,
+            &cell.content,
+            &CELL_START,
+            &CellCursor::at(cell_layout.items.len(), 0),
+            cell_x,
+            col_w,
+            cell_cursor_y,
+            v_offset,
+            ecm,
+            ctx,
+            gradient_specs,
+            links,
+            tagger,
+            hf_sub,
+            behind,
+            f32::NEG_INFINITY,
+            true,
+        );
+    } else if let Some(t) = tagger {
+        t.empty_para(content);
+    }
+}
+
+fn render_table_rows(
+    table: &Table,
+    row_layouts: &[RowLayout],
+    col_widths: &[f32],
+    table_left: f32,
+    merge_spans: &HashMap<(usize, usize), f32>,
+    content: &mut Content,
+    cursor_y: &mut f32,
+    ctx: &RenderContext,
+    gradient_specs: &mut Vec<super::GradientSpec>,
+    links: &mut Vec<LinkAnnotation>,
+    // (tags, this table's structure, page) for a nested table in a tagged
+    // cell; header/footer tables stay artifacts.
+    mut tag: Option<(&mut Tags, &mut TableTags, usize)>,
+    rows: std::ops::Range<usize>,
+    hf_sub: Option<&HfSubstitution>,
+    mut behind: BehindLayer<'_>,
+) {
+    for (ri, (row, layout)) in table
+        .rows
+        .iter()
+        .zip(row_layouts.iter())
+        .enumerate()
+        .skip(rows.start)
+        .take(rows.len())
+    {
+        let row_h = layout.height;
+        let row_top = *cursor_y;
+        let row_bottom = row_top - row_h;
+        let bars_before = super::layout::change_bars_len();
+
+        for (ci, ((grid_col, span, cell), cell_layout)) in
+            row.grid_cells().zip(layout.cells.iter()).enumerate()
+        {
+            let col_w = cell_span_width(col_widths, grid_col, span);
+            let cx = cell_x_offset(col_widths, table_left, grid_col);
+            let tagger = cell_tagger(reborrow(&mut tag), row, ri, ci, span, col_widths, grid_col);
+
+            if cell.v_merge == VMerge::Continue {
+                if let Some(mut t) = tagger {
+                    t.empty_cell();
+                }
+                continue;
+            }
+
+            let merge_extra = merge_spans.get(&(ri, grid_col)).copied().unwrap_or(0.0);
+            let effective_h = row_h + merge_extra;
+
+            draw_cell_shading(
+                content,
+                cell.shading,
+                cell.hatch,
+                &cell.borders,
+                cx,
+                row_top - effective_h,
+                col_w,
+                effective_h,
+            );
+            render_cell_box(
+                content,
+                cell,
+                cell_layout,
+                cx,
+                row_top,
+                effective_h,
+                col_w,
+                ctx,
+                gradient_specs,
+                links,
+                tagger,
+                hf_sub,
+                behind.as_deref_mut(),
+            );
+        }
+
+        for (grid_col, span, cell) in row.grid_cells() {
+            let col_w = cell_span_width(col_widths, grid_col, span);
+            let bx = cell_x_offset(col_widths, table_left, grid_col);
+
+            if cell.v_merge == VMerge::Continue {
+                continue;
+            }
+
+            let merge_extra = merge_spans.get(&(ri, grid_col)).copied().unwrap_or(0.0);
+            let effective_bottom = row_bottom - merge_extra;
+
+            draw_cell_borders(
+                content,
+                &cell.borders,
+                ctx.page_height.get(),
+                bx,
+                row_top,
+                effective_bottom,
+                col_w,
+                ri == 0,
+                true,
+            );
+        }
+
+        super::layout::collapse_change_bars_from(bars_before, row_bottom, row_top);
+
+        *cursor_y = row_bottom;
+    }
+}
+
+/// Reborrow a row renderer's tagging context for one more call.
+fn reborrow<'a>(
+    tag: &'a mut Option<(&mut Tags, &mut TableTags, usize)>,
+) -> Option<(&'a mut Tags, &'a mut TableTags, usize)> {
+    tag.as_mut().map(|(t, n, p)| (&mut **t, &mut **n, *p))
+}
+
+/// Draw `chunk` of a nested table (all of it, or one page's piece of a row
+/// split) from the cell layout's own `(col_widths, rows)`.
+fn render_nested_table(
+    table: &Table,
+    content: &mut Content,
+    available_x: f32,
+    available_w: f32,
+    // The host cell's margins when this table floats in it.
+    floating_host: Option<&CellMargins>,
+    cursor_y: &mut f32,
+    ctx: &RenderContext,
+    gradient_specs: &mut Vec<super::GradientSpec>,
+    links: &mut Vec<LinkAnnotation>,
+    // The parent cell's tagger: the nested table is tagged inside that cell.
+    tagger: &mut Option<CellTagger<'_>>,
+    (col_widths, row_layouts): (&[f32], &[RowLayout]),
+    chunk: &Chunk,
+    mut behind: BehindLayer<'_>,
+    floor: f32,
+) {
+    let table_total_w: f32 = col_widths.iter().sum();
+    // A margin/text-anchored float's centre or right position overrides jc.
+    let anchored = table
+        .position
+        .as_ref()
+        .filter(|p| p.h_anchor == "margin" && p.v_anchor == "text");
+    let alignment = match anchored.map(|p| &p.h_position) {
+        Some(crate::model::HorizontalPosition::AlignCenter) => TableAlignment::Center,
+        Some(crate::model::HorizontalPosition::AlignRight) => TableAlignment::Right,
+        _ => table.alignment,
+    };
+    // Word positions a fully over-wide, left-anchored nested float against
+    // its host cell edge rather than adding the host's left padding, in
+    // compat 14 as in 15 (wide-nested-float-edge-wide-m14-left-o108-*).
+    let edge_shift = floating_host
+        .filter(|m| {
+            table.table_indent == 0.0
+                && table_total_w > available_w + m.left + m.right
+                && anchored.is_some_and(|p| {
+                    matches!(p.h_position, crate::model::HorizontalPosition::Offset(x) if x == 0.0)
+                })
+        })
+        .map_or(0.0, |m| m.left);
+    // A positive tblpX moves it right of the cell's text start; a negative one
+    // leaves it there (negative-x-nested-x142-* vs x-142-*).
+    let x_offset = anchored.map_or(0.0, |p| match p.h_position {
+        crate::model::HorizontalPosition::Offset(x) => x.max(0.0),
+        _ => 0.0,
+    });
+    let table_left = match alignment {
+        TableAlignment::Center => available_x + (available_w - table_total_w) / 2.0,
+        TableAlignment::Right => available_x + available_w - table_total_w,
+        TableAlignment::Left => available_x + table.table_indent + x_offset - edge_shift,
+    };
+
+    let merge_spans = compute_merge_spans(table, row_layouts);
+
+    let mut tag = tagger.as_mut().map(|t| t.nested_table(table, chunk.item));
+    let n_rows = table.rows.len().min(row_layouts.len());
+    for piece in row_pieces(n_rows, chunk) {
+        match piece {
+            RowPiece::Rows(range) => render_table_rows(
+                table,
+                row_layouts,
+                col_widths,
+                table_left,
+                &merge_spans,
+                content,
+                cursor_y,
+                ctx,
+                gradient_specs,
+                links,
+                reborrow(&mut tag),
+                range,
+                None,
+                behind.as_deref_mut(),
+            ),
+            RowPiece::Partial { row, starts, ends } => render_partial_row(
+                &table.rows[row],
+                &row_layouts[row],
+                col_widths,
+                table_left,
+                content,
+                cursor_y,
+                ctx,
+                gradient_specs,
+                links,
+                reborrow(&mut tag),
+                starts,
+                ends,
+                row,
+                behind.as_deref_mut(),
+                floor,
+            ),
+        }
+    }
+    if let Some((tags, nested, _)) = tag {
+        nested.finish(tags);
+    }
+}
+
+/// Note where the row's cell paragraphs land, so PAGEREFs and TOC links to
+/// them follow the drawn table, not the pre-pass estimate (issue #166).
+/// ponytail: every cell paragraph takes the row's top, also the ones a split
+/// row carries to the next page.
+fn note_cell_bookmarks(row: &TableRow, pb: &mut super::PageBuilder) {
+    let pos = (pb.all_contents.len(), pb.slot_top);
+    for p in row.cells.iter().flat_map(|c| c.all_paragraphs()) {
+        for bm in &p.bookmarks {
+            pb.cell_bookmarks.entry(bm.clone()).or_insert(pos);
+        }
+    }
+}
+
+fn render_table_row(
+    row: &TableRow,
+    layout: &RowLayout,
+    col_widths: &[f32],
+    table_left: f32,
+    pb: &mut super::PageBuilder,
+    ctx: &RenderContext,
+    row_idx: usize,
+    merge_spans: &HashMap<(usize, usize), f32>,
+) {
+    note_cell_bookmarks(row, pb);
+    let row_h = layout.height;
+    let row_top = pb.slot_top;
+    let row_bottom = row_top - row_h;
+    let bars_before = super::layout::change_bars_len();
+
+    for (ci, ((grid_col, span, cell), cell_layout)) in
+        row.grid_cells().zip(layout.cells.iter()).enumerate()
+    {
+        let col_w = cell_span_width(col_widths, grid_col, span);
+        let cell_x = cell_x_offset(col_widths, table_left, grid_col);
+        // None while repeated header rows are drawn (render_header_rows).
+        let page = pb.all_contents.len();
+        let tagger = cell_tagger(
+            pb.table_tags
+                .as_mut()
+                .map(|table| (&mut pb.tags, table, page)),
+            row,
+            row_idx,
+            ci,
+            span,
+            col_widths,
+            grid_col,
+        );
+
+        if cell.v_merge == VMerge::Continue {
+            if let Some(mut t) = tagger {
+                t.empty_cell();
+            }
+            continue;
+        }
+
+        let merge_extra = merge_spans
+            .get(&(row_idx, grid_col))
+            .copied()
+            .unwrap_or(0.0);
+        let effective_h = row_h + merge_extra;
+
+        draw_cell_shading(
+            &mut pb.content,
+            cell.shading,
+            cell.hatch,
+            &cell.borders,
+            cell_x,
+            row_top - effective_h,
+            col_w,
+            effective_h,
+        );
+
+        let has_content = cell_has_visible_content(&cell_layout.items);
+        if has_content && cell_layout.text_direction == TextDirection::TbRl {
+            render_vertical_cjk_cell(
+                &mut pb.content,
+                cell_layout,
+                cell,
+                cell_x,
+                row_top,
+                effective_h,
+                col_w,
+                &cell_layout.cm,
+                ctx,
+                tagger,
+            );
+        } else {
+            // Repeated header rows are untagged artifacts: no link annotations.
+            let mut no_links = Vec::new();
+            let links = if tagger.is_some() {
+                &mut pb.links
+            } else {
+                &mut no_links
+            };
+            render_cell_box(
+                &mut pb.content,
+                cell,
+                cell_layout,
+                cell_x,
+                row_top,
+                effective_h,
+                col_w,
+                ctx,
+                &mut pb.gradient_specs,
+                links,
+                tagger,
+                None,
+                Some(&mut pb.behind_shapes),
+            );
+            if has_content {
+                move_cell_comment_anchors(ctx, &mut pb.comment_anchors);
+            }
+        }
+    }
+
+    for (grid_col, span, cell) in row.grid_cells() {
+        let col_w = cell_span_width(col_widths, grid_col, span);
+        let bx = cell_x_offset(col_widths, table_left, grid_col);
+
+        // Each row draws its slice of a vertically merged cell, so a span
+        // that crosses a page break ends at the page bottom and resumes on
+        // the next page (nabl's "Sl." column, pages 10-11).
+        let span_below = merge_spans
+            .get(&(row_idx, grid_col))
+            .copied()
+            .unwrap_or(0.0);
+        draw_cell_borders(
+            &mut pb.content,
+            &cell.borders,
+            ctx.page_height.get(),
+            bx,
+            row_top,
+            row_bottom,
+            col_w,
+            cell.v_merge != VMerge::Continue,
+            span_below == 0.0,
+        );
+    }
+
+    super::layout::collapse_change_bars_from(bars_before, row_bottom, row_top);
+
+    pb.slot_top = row_bottom;
+}
+
+fn render_vertical_cjk_cell(
+    content: &mut Content,
+    cell_layout: &CellLayout,
+    cell: &crate::model::TableCell,
+    cell_x: f32,
+    row_top: f32,
+    row_h: f32,
+    col_w: f32,
+    cm: &CellMargins,
+    ctx: &RenderContext,
+    // Tags each paragraph as the cell's P, like a horizontal cell's.
+    mut tagger: Option<CellTagger<'_>>,
+) {
+    let pdf_name_to_entry = super::fonts::by_pdf_name(ctx.fonts);
+
+    let paras: Vec<&CellParagraphLayout> = cell_layout
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            CellContentItem::Paragraph(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    let total_char_h: f32 = paras
+        .iter()
+        .flat_map(|p| &p.lines)
+        .flat_map(|l| &l.chunks)
+        .filter(|c| !c.text.is_empty())
+        .map(|c| c.text.chars().count() as f32 * c.font_size)
+        .sum();
+
+    let avail_h = row_h - cm.top - cm.bottom;
+    // In vertical text cells, paragraph jc controls vertical positioning
+    let effective_v_align = if cell.v_align == CellVAlign::Top {
+        match paras.first().map(|p| p.alignment) {
+            Some(Alignment::Center) => CellVAlign::Center,
+            Some(Alignment::Right) => CellVAlign::Bottom,
+            _ => CellVAlign::Center,
+        }
+    } else {
+        cell.v_align
+    };
+    let v_offset = valign_offset(effective_v_align, avail_h, total_char_h);
+
+    let avail_w = col_w - cm.left - cm.right;
+    let mut char_y = row_top - cm.top - v_offset;
+    let mut char_buf = [0u8; 4];
+
+    for (item, content_item) in cell_layout.items.iter().enumerate() {
+        let CellContentItem::Paragraph(para) = content_item else {
+            continue;
+        };
+        let nodes = tagger
+            .as_mut()
+            .map(|t| t.begin(content, item, para.list_item, false, para.tag_kind()));
+        let mut link_tags = cell_link_tagger(&mut tagger, nodes.map(|(_, body)| body));
+        for line in &para.lines {
+            for chunk in &line.chunks {
+                if chunk.text.is_empty() {
+                    continue;
+                }
+                let fs = chunk.font_size;
+                let entry = pdf_name_to_entry.get(chunk.pdf_font.as_str());
+                let ascender_ratio = entry.and_then(|e| e.ascender_ratio).unwrap_or(0.75);
+                let widths = entry.and_then(|e| e.char_widths_1000.as_ref());
+
+                if let Some(c) = chunk.color {
+                    fill_rgb(content, c);
+                }
+
+                let boundary_space = chunk.boundary_space(entry.copied());
+                content.begin_text();
+                // ponytail: no link annotations in vertical text, so no Link
+                // elements either; add both if a document has one
+                if let Some(lt) = link_tags.as_mut() {
+                    lt.chunk(content, chunk, None, boundary_space, &mut |_| {});
+                }
+                content.set_font(Name(chunk.pdf_font.as_bytes()), fs);
+
+                let mut td_x = 0.0f32;
+                let mut td_y = 0.0f32;
+                for ch in chunk.text.chars() {
+                    let baseline_y = char_y - fs * ascender_ratio;
+                    let char_w = widths
+                        .and_then(|m| m.get(&ch))
+                        .map(|w| w * fs / 1000.0)
+                        .unwrap_or(fs);
+                    let cx = cell_x + cm.left + (avail_w - char_w) / 2.0;
+
+                    let ch_str = ch.encode_utf8(&mut char_buf);
+                    let bytes = encode_text_for_pdf(ch_str, &chunk.pdf_font, &pdf_name_to_entry);
+                    content.next_line(cx - td_x, baseline_y - td_y);
+                    td_x = cx;
+                    td_y = baseline_y;
+                    content.show(Str(&bytes));
+
+                    char_y -= fs;
+                }
+                if boundary_space {
+                    let space = encode_text_for_pdf(" ", &chunk.pdf_font, &pdf_name_to_entry);
+                    content.show(Str(&space));
+                }
+                content.end_text();
+
+                if chunk.color.is_some() {
+                    content.set_fill_gray(0.0);
+                }
+            }
+        }
+        if let Some(lt) = link_tags {
+            lt.finish(content);
+        }
+        end_cell_tag(content, &tagger);
+    }
+}
+
+/// Render a subset of each cell's paragraphs for a split row.
+/// `starts[ci]..ends[ci]` gives the paragraph range for cell `ci`.
+///
+/// Word closes every fragment of a split row as a complete box: the fragment
+/// ends right after its last fitted item (not at the page's content bottom)
+/// with the cell's bottom border drawn there, and the continuation on the
+/// next page starts with the cell's top border again.
+fn render_partial_row(
+    row: &TableRow,
+    layout: &RowLayout,
+    col_widths: &[f32],
+    table_left: f32,
+    content: &mut Content,
+    cursor_y: &mut f32,
+    ctx: &RenderContext,
+    gradient_specs: &mut Vec<super::GradientSpec>,
+    links: &mut Vec<LinkAnnotation>,
+    // (tags, this table's structure, page), as in render_table_rows.
+    mut tag: Option<(&mut Tags, &mut TableTags, usize)>,
+    starts: &[CellCursor],
+    ends: &[CellCursor],
+    row_idx: usize,
+    mut behind: BehindLayer<'_>,
+    floor: f32,
+) {
+    let row_top = *cursor_y;
+    let row_h = partial_row_height(layout, starts, ends, row_top - floor);
+    let row_bottom = row_top - row_h;
+    let bars_before = super::layout::change_bars_len();
+
+    for (ci, ((grid_col, span, cell), cell_layout)) in
+        row.grid_cells().zip(layout.cells.iter()).enumerate()
+    {
+        let col_w = cell_span_width(col_widths, grid_col, span);
+        let cell_x = cell_x_offset(col_widths, table_left, grid_col);
+        let tagger = cell_tagger(
+            reborrow(&mut tag),
+            row,
+            row_idx,
+            ci,
+            span,
+            col_widths,
+            grid_col,
+        );
+
+        if cell.v_merge == VMerge::Continue {
+            if let Some(mut t) = tagger {
+                t.empty_cell();
+            }
+            continue;
+        }
+
+        let start = starts.get(ci).unwrap_or(&CELL_START);
+        let done = CellCursor::at(cell_layout.items.len(), 0);
+        let end = ends.get(ci).unwrap_or(&done);
+
+        draw_cell_shading(
+            content,
+            cell.shading,
+            cell.hatch,
+            &cell.borders,
+            cell_x,
+            row_bottom,
+            col_w,
+            row_h,
+        );
+
+        let has_content = cell_has_visible_content(
+            cursor_chunks(&cell_layout.items, start, end).map(|c| &cell_layout.items[c.item]),
+        );
+
+        if has_content {
+            render_cell_content(
+                content,
+                &cell_layout.items,
+                &cell.content,
+                start,
+                end,
+                cell_x,
+                col_w,
+                row_top - cell_layout.cm.top,
+                0.0,
+                &cell_layout.cm,
+                ctx,
+                gradient_specs,
+                links,
+                tagger,
+                None,
+                behind.as_deref_mut(),
+                floor + cell_layout.cm.bottom,
+                false,
+            );
+        } else if let Some(t) = tagger.filter(|_| *start == CELL_START) {
+            t.empty_para(content);
+        }
+    }
+
+    // A continued row tops its page with each cell's own top border, not the
+    // edge it shares with the row above (radiographer's nested row, `nil` on
+    // top, starts page 2 with no line).
+    let continued = starts.iter().any(|s| *s != CELL_START);
+    for (grid_col, span, cell) in row.grid_cells() {
+        let col_w = cell_span_width(col_widths, grid_col, span);
+        let bx = cell_x_offset(col_widths, table_left, grid_col);
+        let mut borders = cell.borders;
+        if continued && let Some(own) = borders.own_top {
+            borders.top = own;
+        }
+
+        // A merged cell's slice, as in render_table_row; every chunk of a
+        // split row closes at its page bottom.
+        draw_cell_borders(
+            content,
+            &borders,
+            ctx.page_height.get(),
+            bx,
+            row_top,
+            row_bottom,
+            col_w,
+            cell.v_merge != VMerge::Continue,
+            true,
+        );
+    }
+
+    super::layout::collapse_change_bars_from(bars_before, row_bottom, row_top);
+
+    *cursor_y = row_bottom;
+}
+
+fn render_header_rows(
+    table: &Table,
+    row_layouts: &[RowLayout],
+    col_widths: &[f32],
+    table_left: f32,
+    pb: &mut super::PageBuilder,
+    ctx: &RenderContext,
+    merge_spans: &HashMap<(usize, usize), f32>,
+    header_count: usize,
+) {
+    // Repeated header rows are page furniture: tagged once, where they first appear.
+    let table_tags = pb.table_tags.take();
+    for hi in 0..header_count {
+        render_table_row(
+            &table.rows[hi],
+            &row_layouts[hi],
+            col_widths,
+            table_left,
+            pb,
+            ctx,
+            hi,
+            merge_spans,
+        );
+    }
+    pb.table_tags = table_tags;
+}
+
+/// Word 2013+ layout puts the outer edge of the table's left border band at
+/// the indent, so the border grid (drawn centred) sits half a band further
+/// right, and cell text follows it: rehab_centre's 2.25pt bands span
+/// 72.0–74.25 from a 72pt margin and text starts 5.4 + 1.125 in.
+pub(super) fn word2013_border_shift(table: &Table) -> f32 {
+    table
+        .first_cell()
+        .map_or(0.0, |c| c.borders.left.band() / 2.0)
+}
+
+/// The outer border bands sit inside a table's flow height: the top band
+/// starts where the previous text ends and the next paragraph starts below
+/// the bottom band. The row insets hold the inner halves (docx::tables).
+fn outer_band(row: Option<&TableRow>, top: bool) -> f32 {
+    row.map_or(0.0, |r| {
+        r.cells
+            .iter()
+            .map(|c| {
+                if top {
+                    c.borders.top.band()
+                } else {
+                    c.borders.bottom.band()
+                }
+            })
+            .fold(0.0f32, f32::max)
+    })
+}
+
+/// A non-floating table's left edge in the area it is aligned in.
+fn aligned_table_left(
+    table: &Table,
+    (area_left, area_width): (f32, f32),
+    total_width: f32,
+    compat_mode: u32,
+) -> f32 {
+    use crate::model::TableAlignment;
+    let left = match table.alignment {
+        TableAlignment::Center => area_left + (area_width - total_width) / 2.0,
+        TableAlignment::Right => area_left + area_width - total_width,
+        // Before Word 2013 layout, tblInd positions the first cell's text, so
+        // the edge sits one cell margin further out, even for an explicit
+        // tblInd of 0 (chinese_costume). Word 2013+ (compat 15) never outdents:
+        // the border sits at the margin and the text inside it. Nor does any
+        // layout outdent a table with neither a style nor a tblInd, even with
+        // its own tblCellMar (Word probes on section-mark-after-table-inline-
+        // compat14: adding tblInd 0 moves the text from 77.5 to the margin;
+        // case131's second column at the margin + 300pt + its 0.5pt margin).
+        TableAlignment::Left if compat_mode >= 15 => {
+            area_left + table.table_indent + word2013_border_shift(table)
+        }
+        // Before compat 15 the left border is centred on the indent (table
+        // probe 6: a 1.5pt band spans 71.25–72.75 from a 72pt margin).
+        TableAlignment::Left if !(table.has_table_style || table.table_indent_explicit) => {
+            area_left + table.table_indent
+        }
+        TableAlignment::Left => area_left + table.table_indent - table.first_cell_left_margin(),
+    };
+    // A right-to-left table starts at the right margin, its offset mirrored.
+    if table.bidi_visual && matches!(table.alignment, TableAlignment::Left) {
+        area_left + area_width - total_width - (left - area_left)
+    } else {
+        left
+    }
+}
+
+/// The column widths a body table renders with: AutoFit and percentage
+/// widths resolved against the page or newspaper column.
+pub(super) fn resolved_col_widths(
+    table: &Table,
+    sp: &SectionProperties,
+    ctx: &RenderContext,
+    column_bounds: Option<(f32, f32)>,
+) -> Vec<f32> {
+    let available_w = column_bounds.map(|(_, w)| w);
+    // Top-level table: an AutoFit-to-Window table fills the available width
+    // (page text column or newspaper column), so feed the content width even
+    // when no column bound is set. Passed as the dedicated fill target so it
+    // only steers the window-fill path, not the nested-table shrink path.
+    let fit_w = available_w.unwrap_or(sp.page_width - sp.margin_left - sp.margin_right);
+    let mut col_widths = if table.fixed_layout {
+        fixed_columns(table, fit_w, ctx.compat_mode)
+    } else if let Some(col_w) = available_w {
+        // A table in a newspaper column sizes like one on the page, then is
+        // squeezed into the column (the nested-table path shrank it to content).
+        let mut w = auto_fit_columns(
+            table,
+            ctx.fonts,
+            None,
+            Some(fit_w),
+            table.autofit_overhang(ctx.compat_mode),
+        );
+        squeeze_to_width(&mut w, &min_content_widths(table, ctx.fonts), col_w);
+        w
+    } else {
+        auto_fit_columns(
+            table,
+            ctx.fonts,
+            available_w,
+            Some(fit_w),
+            table.autofit_overhang(ctx.compat_mode),
+        )
+    };
+    apply_pct_width(table, &mut col_widths, fit_w, ctx.compat_mode);
+    col_widths
+}
+
+/// `override_pos`: positioning info for floating tables.
+pub(super) fn render_table(
+    table: &Table,
+    sp: &SectionProperties,
+    ctx: &RenderContext,
+    pb: &mut super::PageBuilder,
+    sect_idx: usize,
+    prev_space_after: f32,
+    mut override_pos: Option<super::FloatingTablePos>,
+    footnotes: &std::collections::HashMap<u32, crate::model::Footnote>,
+    effective_margin_bottom: &mut f32,
+    column_bounds: Option<(f32, f32)>,
+) {
+    let col_widths = resolved_col_widths(table, sp, ctx, column_bounds);
+    let total_w: f32 = col_widths.iter().sum();
+    let row_layouts = compute_row_layouts(table, &col_widths, ctx, None);
+    let merge_spans = compute_merge_spans(table, &row_layouts);
+    // The table's column (the page's text area in one column): where it
+    // aligns and where its footnotes go.
+    let area = column_bounds.unwrap_or((sp.margin_left, sp.text_width()));
+
+    let preceding_float_zone = table
+        .position
+        .as_ref()
+        .filter(|p| !p.allow_overlap)
+        .and_then(|_| pb.float_zone.clone());
+    // An overlapping floating table drawn over an earlier one does not lift
+    // the text the earlier one holds down: Word clears displaced-anchor-*'s
+    // "After clearing" below the tall first table, wherever the second sits.
+    let overlapped_table_zone = table
+        .position
+        .as_ref()
+        .filter(|p| p.allow_overlap)
+        .and_then(|_| pb.float_zone.clone())
+        .filter(|z| z.from_table);
+    let mut displaced_text_anchor = None;
+    if table.position.as_ref().is_some_and(|p| !p.allow_overlap)
+        && let Some(ref zone) = pb.float_zone
+        && let Some(ref mut fp) = override_pos
+    {
+        let height: f32 = row_layouts.iter().map(|r| r.height).sum();
+        if fp.x < zone.obj_right
+            && fp.x + total_w > zone.obj_left
+            && fp.y > zone.bottom_y
+            && fp.y - height < zone.top_y
+        {
+            fp.y = zone.bottom_y - fp.top_from_text;
+            let side_room = zone.side_strip(area);
+            if zone.from_table
+                && fp.v_anchor_text
+                && fp.v_offset_pt >= 0.0
+                && side_room < super::MIN_EMPTY_STRIP
+            {
+                // The preceding wide float blocks the anchor paragraph too.
+                // Keep the relocated anchor rather than restoring it above both
+                // tables; otherwise a later clearing break loses occupied lines.
+                // The table keeps its tblpY below the moved anchor (Word for Mac
+                // probes: tblpY 1, 100 and 300 under a full-width float).
+                displaced_text_anchor = Some(fp.y);
+                fp.y -= fp.v_offset_pt;
+            }
+            if let Some(pos) = table.position.as_ref() {
+                fp.constrain_nonoverlap_left(
+                    pos,
+                    sp,
+                    column_bounds.map_or(sp.margin_left, |(left, _)| left),
+                    ctx.compat_mode,
+                );
+            }
+        }
+    }
+    let is_floating = override_pos.is_some();
+    // A text-anchored floating table sitting at or below its anchor paginates like
+    // an inline table: Word starts it in the room left on the page and breaks it
+    // across pages, between rows (indigenous_innovation p1-2, trHeight rows) or
+    // inside a row (croatian_grant_guidelines p4-5) — annotations #232 #200. Only
+    // a table hoisted above its anchor (negative tblpY, pendulum_mechanics) moves
+    // whole to the next page with the anchor, and only then may a row overflow be
+    // split regardless of its own splittability.
+    let flows_inline = override_pos
+        .as_ref()
+        .is_some_and(|fp| fp.v_anchor_text && fp.v_offset_pt >= 0.0);
+    let keep_with_anchor = is_floating && !flows_inline;
+    // A text-anchored table counts from below the previous paragraph's space
+    // after; one placed against the page or margin keeps its place (Word
+    // examples, fixture float-table-band-before: 24pt after the paragraph above
+    // a page-top or margin-top table, 20pt above one 300pt down).
+    let float_space_after = if override_pos.as_ref().is_some_and(|fp| fp.v_anchor_text) {
+        prev_space_after
+    } else {
+        0.0
+    };
+    let cursor_before = pb.slot_top;
+    let (table_left, saved_slot_top, text_margins) = if let Some(ref fp) = override_pos {
+        // The float zone starts at the table's drawn top.
+        let saved = Some((
+            displaced_text_anchor.unwrap_or(pb.slot_top - prev_space_after),
+            fp.y - float_space_after,
+        ));
+        pb.slot_top = fp.y;
+        (fp.x, saved, (fp.top_from_text, fp.bottom_from_text))
+    } else {
+        let left = aligned_table_left(table, area, total_w, ctx.compat_mode);
+        (left, None, (0.0, 0.0))
+    };
+    if let Some(fp) = &override_pos {
+        pb.float_table_extent = Some(super::FloatTableExtent {
+            left: table_left,
+            right: table_left + total_w,
+            left_from_text: fp.left_from_text,
+            right_from_text: fp.right_from_text,
+        });
+    }
+
+    // For non-floating tables, prev_space_after offsets the table start.
+    // For floating tables, it was already consumed into the saved cursor position.
+    // At a page top a table follows the paragraphs' rule with no space before:
+    // radiographer's section 2 table starts at its header's bottom, not 10pt below.
+    pb.slot_top -= if is_floating {
+        float_space_after
+    } else {
+        pb.page_top_gap(sp, 0.0, prev_space_after)
+            .unwrap_or(prev_space_after)
+    };
+    // An inline table retains its alignment and width instead of using the
+    // paragraph's narrow wrapping strip. Clear a preceding floating table
+    // when the actual table rectangles intersect.
+    if !is_floating {
+        let total_height: f32 = row_layouts.iter().map(|row| row.height).sum();
+        if let Some(zone) = pb.float_zone.as_ref()
+            && zone.from_table
+            && table_left < zone.wrap_right()
+            && table_left + total_w > zone.wrap_left()
+            // A float whose wrap area stays in the margin pushes nothing, even a
+            // table running onto its box (dutch_government_budget_letter; Word
+            // probes 2026-10-28: 1pt outside the column stays beside, 1pt inside clears).
+            && !zone.outside_column(area)
+            && pb.slot_top > zone.bottom_y
+            && pb.slot_top - total_height < zone.top_y
+        {
+            pb.slot_top = zone.bottom_y;
+            pb.float_zone = None;
+        }
+    }
+    pb.slot_top -= outer_band(table.rows.first(), true) / 2.0;
+    pb.keep_pending_first_page(cursor_before);
+
+    // Count contiguous header rows from the start of the table (per OOXML spec,
+    // only contiguous header rows starting from row 0 are repeated).
+    let header_count = table.rows.iter().take_while(|r| r.is_header).count();
+
+    // Pre-scan each row for footnote and endnote references so we can reserve
+    // space as rows containing notes are rendered.
+    let note_ids = |pick: fn(&crate::model::Run) -> Option<u32>| -> Vec<Vec<u32>> {
+        table
+            .rows
+            .iter()
+            .map(|row| {
+                row.cells
+                    .iter()
+                    .flat_map(|cell| cell.all_paragraphs())
+                    .flat_map(|p| &p.runs)
+                    .filter_map(pick)
+                    .collect()
+            })
+            .collect()
+    };
+    let row_footnote_ids = note_ids(|run| run.footnote_id);
+    let row_endnote_ids = note_ids(|run| run.endnote_id);
+
+    // Word repeats no header rows above a row whose minimum does not fit
+    // below them on a fresh page (examples: a 30pt header over a
+    // 250pt at-least row on a 260pt body).
+    let header_h: f32 = row_layouts[..header_count].iter().map(|r| r.height).sum();
+    let flush_and_render_headers = |pb: &mut super::PageBuilder, ri: usize, emb: &mut f32| {
+        pb.begin_next_page(sect_idx, sp, emb, ctx);
+        if header_count > 0
+            && ri >= header_count
+            && row_layouts[ri]
+                .split_min
+                .is_none_or(|m| header_h + m <= pb.slot_top - *emb)
+        {
+            render_header_rows(
+                table,
+                &row_layouts,
+                &col_widths,
+                table_left,
+                pb,
+                ctx,
+                &merge_spans,
+                header_count,
+            );
+        }
+    };
+
+    let mut did_flush_while_floating = false;
+    // Set to the fresh page's body top when a floating table is pushed whole
+    // onto it. The table's anchor paragraph flows from here even though the
+    // cursor is left below the table, so its paragraph-relative shapes anchor
+    // correctly. `None` while the table stays on its original page.
+    let mut flushed_page_top: Option<f32> = None;
+    // tblpY to apply to the render start of a vertAnchor="text" table (0 for
+    // page/margin anchors). Raised before rendering, restored after, so the
+    // table sits where Word puts it without shifting the following flow.
+    let text_anchor_offset = override_pos
+        .as_ref()
+        .filter(|fp| fp.v_anchor_text)
+        .map_or(0.0, |fp| fp.v_offset_pt);
+
+    // Split an oversized row across pages, rendering partial rows and
+    // flushing pages between chunks until every cell is fully emitted.
+    let split_row_across_pages = |row: &TableRow,
+                                  layout: &RowLayout,
+                                  pb: &mut super::PageBuilder,
+                                  ri: usize,
+                                  did_flush: &mut bool,
+                                  emb: &mut f32| {
+        let ncells = layout.cells.len();
+        let mut starts = vec![CellCursor::default(); ncells];
+        // A page that follows one nothing fitted on must take something.
+        let mut force = false;
+        loop {
+            let avail = pb.slot_top - *emb;
+            let mut ends = Vec::with_capacity(ncells);
+            let mut all_done = true;
+
+            for ci in 0..ncells {
+                let end = find_cell_split(&layout.cells[ci], &starts[ci], avail, force);
+                if end.item < layout.cells[ci].items.len() {
+                    all_done = false;
+                }
+                ends.push(end);
+            }
+            force = ends == starts;
+            if !force {
+                note_cell_bookmarks(row, pb);
+            }
+
+            let page = pb.all_contents.len();
+            render_partial_row(
+                row,
+                layout,
+                &col_widths,
+                table_left,
+                &mut pb.content,
+                &mut pb.slot_top,
+                ctx,
+                &mut pb.gradient_specs,
+                &mut pb.links,
+                pb.table_tags.as_mut().map(|t| (&mut pb.tags, t, page)),
+                &starts,
+                &ends,
+                ri,
+                Some(&mut pb.behind_shapes),
+                *emb,
+            );
+            move_cell_comment_anchors(ctx, &mut pb.comment_anchors);
+
+            if all_done {
+                break;
+            }
+
+            starts = ends
+                .into_iter()
+                .zip(&layout.cells)
+                .map(|(e, c)| skip_finished_row(c, e))
+                .collect();
+            if is_floating {
+                *did_flush = true;
+            }
+            flush_and_render_headers(pb, ri, emb);
+        }
+    };
+
+    // A floating table whose first row doesn't fit in the space left on the
+    // current page is pushed whole to the next page rather than overlapping the
+    // bottom content. vertAnchor="text" tables flow with their anchor text, so
+    // Word starts them on the next page; the per-row split path below can't
+    // rescue this when the first row's cells aren't splittable (e.g. headers
+    // that are OMML math). Re-anchor to the top of the fresh page. Setting
+    // did_flush_while_floating leaves the cursor on the new page so the
+    // following content flows below the table instead of behind it.
+    // (Pendulum #172/#173: the data table was landing on page 1 over list
+    // item 10, which also pushed the following illustration off-page.)
+    if keep_with_anchor && !row_layouts.is_empty() {
+        let eff_top = effective_slot_top(
+            sp,
+            pb.is_first_page_of_section,
+            pb.page_num(ctx.sections),
+            ctx,
+        );
+        let at_page_top = (pb.slot_top - eff_top).abs() < 1.0;
+        let available = pb.slot_top - *effective_margin_bottom;
+        let total_h: f32 = row_layouts.iter().map(|r| r.height).sum();
+        let page_content_h = eff_top - *effective_margin_bottom;
+        // A page- or margin-anchored table positioned above the text already on
+        // its anchor's page, too tall to fit below that position, starts on the
+        // next page at the same position and breaks from there; the anchor's
+        // page keeps its text (Word for Mac probe p24f at compat 15 and a
+        // corpus deleted table, both 1.3 pages tall at tblpY 72pt: the anchor's
+        // page ends half empty, the table fills the next page and a third).
+        // One that fits stays put, and Word re-flows the page's text below it
+        // (p24a, p24g) — not modelled; compat 14 keeps a row or two on the
+        // anchor's page (p24c, p24d) — not modelled either.
+        let flow_top = saved_slot_top.map_or(pb.slot_top, |(flow, _)| flow);
+        let over_placed_text = override_pos.as_ref().is_some_and(|fp| !fp.v_anchor_text)
+            && flow_top < pb.slot_top - 0.5
+            && (flow_top - eff_top).abs() >= 1.0;
+        if over_placed_text && total_h > available {
+            let table_top = pb.slot_top;
+            pb.begin_next_page(sect_idx, sp, effective_margin_bottom, ctx);
+            did_flush_while_floating = true;
+            flushed_page_top = Some(pb.slot_top);
+            pb.slot_top = table_top;
+        } else if !at_page_top && total_h > available && total_h <= page_content_h {
+            // Keep the floating table together: when it doesn't fit in the space
+            // left here but would fit on a fresh page, move the whole table to the
+            // next page (re-anchoring to the top). Using the full height (not just
+            // the first row) is robust to short header rows. Tables taller than a
+            // full page fall through to the per-row split path below.
+            pb.begin_next_page(sect_idx, sp, effective_margin_bottom, ctx);
+            did_flush_while_floating = true;
+            // The body top is where the anchor paragraph flows (and where its
+            // paragraph-relative shapes anchor). The table itself, however,
+            // honors tblpY relative to that anchor — for vertAnchor="text" a
+            // negative tblpY lifts it above the top margin. Render the table from
+            // the offset position; the flow cursor is restored to the un-offset
+            // bottom afterwards so following content is unaffected.
+            flushed_page_top = Some(pb.slot_top);
+            pb.slot_top -= text_anchor_offset;
+        }
+    }
+
+    let row_notes_extra = |pb: &super::PageBuilder, ri: usize| {
+        let h: f32 = row_footnote_ids[ri]
+            .iter()
+            .filter(|id| !pb.footnote_ids_set.contains(id))
+            .map(|&id| super::footnotes::footnote_height(id, footnotes, ctx, area.1))
+            .sum();
+        if h > 0.0 && pb.col_fn_reserved == 0.0 {
+            h + ctx.note_separator.height
+        } else {
+            h
+        }
+    };
+    for (ri, (row, layout)) in table.rows.iter().zip(row_layouts.iter()).enumerate() {
+        // Pre-compute extra footnote space this row introduces, so the
+        // page-break check below accounts for it before rendering.
+        let row_fn_extra = row_notes_extra(pb, ri);
+
+        let row_h = layout.height;
+        log::debug!(
+            "TABLE row={} row_h={:.2} cells={} slot_top={:.2}",
+            ri,
+            row_h,
+            layout.cells.len(),
+            pb.slot_top
+        );
+        let eff_top = effective_slot_top(
+            sp,
+            pb.is_first_page_of_section,
+            pb.page_num(ctx.sections),
+            ctx,
+        );
+        let eff_bottom = *effective_margin_bottom + row_fn_extra;
+        let at_page_top = (pb.slot_top - eff_top).abs() < 1.0;
+        let available_h = pb.slot_top - eff_bottom;
+        let page_content_h = eff_top - eff_bottom;
+        // A row whose first cell holds a keepNext paragraph stays on the page
+        // where the next row starts, and such rows chain: italian_academic's
+        // Titolo2 rows move to page 2 together although the first would fit.
+        // Rows with keepNext only in later cells split as usual (a 199-page
+        // corpus document's syllabus tables). ponytail: first-cell rule fits
+        // the three measured documents; probe if one disagrees.
+        let chain_moves = !at_page_top && row_layouts[ri].keeps_next && {
+            let mut k = ri;
+            let mut h = 0.0;
+            while k < table.rows.len() && row_layouts[k].keeps_next {
+                h += row_layouts[k].height;
+                k += 1;
+            }
+            // ponytail: a splittable next row's start = a 14pt line, as the
+            // split guard below; measure its first chunk if one misjudges.
+            if let Some(next) = row_layouts.get(k) {
+                h += next.split_min.map_or(next.height, |m| m.max(14.0));
+            }
+            h > available_h && h <= page_content_h
+        };
+
+        // Word splits any non-cantSplit row that overflows the page remainder,
+        // filling the current page before continuing on the next — there is no
+        // minimum row height for splitting. But a row with an explicit
+        // trHeight (exact or atLeast) never breaks in Word; it migrates whole
+        // (arizona_physical / traditional_skills vs isla / master_thesis).
+        // A cell must have somewhere to break — several items, or a paragraph
+        // of two lines or more (one may stay, one may follow) — for the split to
+        // produce anything, and every cell's first chunk must genuinely fit
+        // in the remaining space (otherwise find_cell_split's force-included
+        // first item would overflow the footer and the row migrates whole
+        // instead).
+        // Word 2013+ layout keeps two lines of a paragraph on each side of a
+        // row break, Word 2010 layout one (`find_cell_split`).
+        let widow = |p: &CellParagraphLayout| if p.two_line_widow { 2 } else { 1 };
+        let any_cell_multi_item = layout.cells.iter().any(|c| {
+            c.items.len() > 1
+                || c.items.iter().any(|it| match it {
+                    CellContentItem::Paragraph(p) => p.lines.len() >= 2 * widow(p) && !p.keep_lines,
+                    CellContentItem::NestedTable { rows, .. } => {
+                        rows.len() >= 2 || rows.iter().any(|r| r.split_min.is_some())
+                    }
+                })
+        });
+        // A row starts with `start_lines` lines of a cell's first paragraph:
+        // two in Word 2013+ layout or for a row taller than the page
+        // (croatian_grant's 776pt row waits for the next page rather than put
+        // one line in the 21.8pt above a footnote), else one.
+        let start_lines =
+            |p: &CellParagraphLayout| if row_h > page_content_h { 2 } else { widow(p) };
+        // Whether every cell's first chunk fits in the room left: its first
+        // paragraph (`start_lines` of a longer one) or first nested row, with
+        // the opening space before that find_cell_split charges.
+        let first_chunks_fit = layout.cells.iter().all(|c| {
+            c.items.first().is_none_or(|it| {
+                let end = match it {
+                    CellContentItem::Paragraph(p)
+                        if p.lines.len() >= 2 * start_lines(p) && !p.keep_lines =>
+                    {
+                        Some(start_lines(p))
+                    }
+                    CellContentItem::Paragraph(_) => None,
+                    CellContentItem::NestedTable { rows, .. } => Some(keep_chain_end(rows, 0)),
+                };
+                c.cm.top
+                    + c.cm.bottom
+                    + chunk_space_before(it, 0, &CELL_START)
+                    + item_chunk_height(
+                        it,
+                        &Chunk {
+                            item: 0,
+                            l0: 0,
+                            l1: end,
+                            from: &[],
+                            to: &[],
+                        },
+                        &CELL_START,
+                        f32::INFINITY,
+                    )
+                    <= available_h
+            })
+        });
+        // A nested table may split within its first row. Requiring that whole
+        // row above would reject a fitting first paragraph and move the outer
+        // row early. Use the same recursive cursors as the actual split, and
+        // retain the overflow guard for force-included first items.
+        let first_chunks_fit = first_chunks_fit
+            || (layout.cells.iter().any(|c| {
+                matches!(c.items.first(), Some(CellContentItem::NestedTable { rows, .. })
+                if rows.first().is_some_and(|r| r.split_min.is_some()))
+            }) && {
+                let ends: Vec<CellCursor> = layout
+                    .cells
+                    .iter()
+                    .map(|c| find_cell_split(c, &CELL_START, available_h, false))
+                    .collect();
+                ends.iter().any(|e| *e != CELL_START)
+                    && partial_row_height(layout, &[], &ends, f32::INFINITY) <= available_h
+            });
+        // Word splits with one line of room: nabl's "Remarks" row breaks
+        // between its paragraphs with 30pt left. ponytail: 14pt (a line) guard
+        // so a near-boundary rounding error can't split off nothing; drop it
+        // if a reference ever splits with less.
+        // A long first paragraph needs only its first two lines in the room
+        // left, as split rows break between lines (bulgarian_road's row ends
+        // page 2 with three lines of a six-line cell paragraph).
+        let can_meaningfully_split = layout.split_min.is_some_and(|m| available_h >= m)
+            && any_cell_multi_item
+            && !at_page_top
+            && available_h > 14.0
+            && first_chunks_fit;
+
+        // A row taller than a page must split, but not where its cells can't
+        // start: away from the page top each cell needs its first paragraph,
+        // or two lines of a long one (widow control), in the room left —
+        // croatian_grant's 776pt row starts on the next page rather than in
+        // the 28pt above a footnote.
+        // A large first-page header can leave less body room than the next
+        // page. Do not override trHeight's split minimum just because the
+        // row is taller than this page when it fits intact on the next one.
+        let next_page_room = || {
+            let page = pb.page_num(ctx.sections) + 1;
+            effective_slot_top(sp, false, page, ctx)
+                - super::header_footer::compute_effective_margin_bottom(sp, false, page, ctx)
+                - row_fn_extra
+        };
+        let taller_than_page = row_h > page_content_h && (at_page_top || row_h > next_page_room());
+        // Modern Word retries cantSplit rows at a fresh page, then splits
+        // content taller than that page. Legacy Word clips such rows instead.
+        let oversized_cant_split = ctx.compat_mode >= 15 && taller_than_page && !row.height_exact;
+        // Even when the content needs multiple pages, an explicit minimum
+        // must fit before the row starts. Retry at the next page top, where
+        // oversized rows can split without repeatedly moving forward; a
+        // minimum taller than any page moves too (Word examples: an
+        // 810pt minimum leaves 348pt free and starts on the next 648pt page).
+        let minimum_moves = !at_page_top && layout.split_min.is_some_and(|m| m > available_h);
+        let must_split = (taller_than_page || keep_with_anchor)
+            && !minimum_moves
+            && (!row.cant_split || (oversized_cant_split && at_page_top))
+            && (at_page_top || first_chunks_fit);
+        if row_h > available_h && (must_split || can_meaningfully_split) && !chain_moves {
+            split_row_across_pages(
+                row,
+                layout,
+                pb,
+                ri,
+                &mut did_flush_while_floating,
+                effective_margin_bottom,
+            );
+        } else if !at_page_top && (row_h > available_h || chain_moves) {
+            if is_floating {
+                did_flush_while_floating = true;
+            }
+            // Word closes a merged cell that runs on past the page break with
+            // its bottom border (nabl page 10's "26." column).
+            if ri > 0 {
+                for (grid_col, span, cell) in table.rows[ri - 1].grid_cells() {
+                    if merge_spans
+                        .get(&(ri - 1, grid_col))
+                        .is_some_and(|&below| below > 0.0)
+                    {
+                        let bx = cell_x_offset(&col_widths, table_left, grid_col);
+                        let right = bx + cell_span_width(&col_widths, grid_col, span);
+                        let y = pb.slot_top;
+                        draw_border(
+                            &mut pb.content,
+                            &cell.borders.bottom,
+                            ctx.page_height.get(),
+                            bx,
+                            y,
+                            right,
+                            y,
+                        );
+                    }
+                }
+            }
+            flush_and_render_headers(pb, ri, effective_margin_bottom);
+            // After flushing + rendering header rows, re-check if the row
+            // fits on the fresh page.  If repeating headers consumed enough
+            // space that the row no longer fits, split it across pages
+            // instead of rendering blindly (which would overflow the footer).
+            let new_eff_top = effective_slot_top(
+                sp,
+                pb.is_first_page_of_section,
+                pb.page_num(ctx.sections),
+                ctx,
+            );
+            let new_eff_bot = *effective_margin_bottom;
+            let new_available = pb.slot_top - new_eff_bot;
+            let new_page_h = new_eff_top - new_eff_bot;
+            if row_h > new_available
+                && (row_h > new_page_h || keep_with_anchor)
+                && (!row.cant_split || oversized_cant_split)
+            {
+                split_row_across_pages(
+                    row,
+                    layout,
+                    pb,
+                    ri,
+                    &mut did_flush_while_floating,
+                    effective_margin_bottom,
+                );
+            } else {
+                render_table_row(
+                    row,
+                    layout,
+                    &col_widths,
+                    table_left,
+                    pb,
+                    ctx,
+                    ri,
+                    &merge_spans,
+                );
+            }
+        } else {
+            render_table_row(
+                row,
+                layout,
+                &col_widths,
+                table_left,
+                pb,
+                ctx,
+                ri,
+                &merge_spans,
+            );
+        }
+
+        // Register footnotes from this row and reserve space for them. Notes
+        // the row leaves no room for go to the next page (Word examples: a
+        // page-top row with an 800pt minimum fills the 648pt body and its note
+        // starts the next page).
+        let notes_fit = pb.slot_top - *effective_margin_bottom >= row_notes_extra(pb, ri) - 0.5;
+        for &fn_id in &row_footnote_ids[ri] {
+            let fn_h = footnotes
+                .contains_key(&fn_id)
+                .then(|| super::footnotes::footnote_height(fn_id, footnotes, ctx, area.1));
+            if notes_fit {
+                pb.book_footnote(
+                    fn_id,
+                    area,
+                    fn_h,
+                    ctx.note_separator.height,
+                    effective_margin_bottom,
+                );
+            } else {
+                pb.carry_footnote(
+                    fn_id,
+                    area,
+                    fn_h,
+                    ctx.note_separator.height,
+                    super::footnotes::WHOLE_NOTE,
+                );
+            }
+        }
+
+        // Register endnotes from this row; they render at end of document
+        // (last page), so just collect IDs in encounter order.
+        for &en_id in &row_endnote_ids[ri] {
+            if pb.endnote_ids_set.insert(en_id) {
+                pb.endnote_ids.push(en_id);
+            }
+        }
+
+        if pb.slot_top < *effective_margin_bottom - 1.0 {
+            log::warn!(
+                "Table overflow: row={} slot_top={:.2} < eff_margin_bottom={:.2} row_h={:.2} page={}",
+                ri,
+                pb.slot_top,
+                *effective_margin_bottom,
+                row_h,
+                pb.all_contents.len(),
+            );
+        }
+    }
+    pb.slot_top -= outer_band(table.rows.last(), false) / 2.0;
+
+    if let Some((saved, table_top_y)) = saved_slot_top {
+        if did_flush_while_floating {
+            // Table spanned multiple pages — cursor is already on the new page,
+            // don't restore to the pre-table position or register a float zone.
+            // The cursor stays below the table so following text flows below it
+            // (not behind it). But the table's anchor paragraph — the next block,
+            // which carries vertAnchor="text" shapes — must anchor its
+            // paragraph-relative shapes from the top of the page body where the
+            // anchor naturally flows, not from the cursor below the table. Hand
+            // that top down as a one-shot override (pendulum graph + pendulum
+            // illustrations were dropping by the table's height). Only the
+            // whole-table-to-next-page path sets flushed_page_top; the per-row
+            // split path (taller-than-page tables) leaves it None, so the
+            // override is skipped there rather than anchoring shapes off-page.
+            if let Some(top) = flushed_page_top {
+                pb.pending_float_anchor = Some((
+                    super::PendingAnchor {
+                        top,
+                        kind: super::AnchorKind::TableMoved,
+                    },
+                    pb.pending_float_anchor.and_then(|(_, b)| b),
+                ));
+                // Undo the tblpY offset applied to the render start so the flow
+                // cursor sits at the un-offset table bottom — following content
+                // (which is correctly placed) must not shift with the table.
+                pb.slot_top += text_anchor_offset;
+            }
+        } else {
+            let (top_margin, bottom_margin) = text_margins;
+            let table_bottom = pb.slot_top;
+
+            // Restore the anchor's body position, relocated with the table
+            // when a preceding wide float blocked it. The float zone lets
+            // paragraph layout decide whether to wrap beside or push below.
+            pb.slot_top = saved;
+
+            if table_bottom < saved {
+                let fp = override_pos.as_ref().unwrap();
+                // Use BothSides wrapping when the table has >=72pt of space on each side
+                let text_area_left = sp.margin_left;
+                let text_area_right = sp.page_width - sp.margin_right;
+                let space_left = table_left - text_area_left;
+                let space_right = text_area_right - (table_left + total_w);
+                let wrap_text = if space_left >= 72.0 && space_right >= 72.0 {
+                    crate::model::WrapText::BothSides
+                } else {
+                    crate::model::WrapText::Largest
+                };
+                let zone = super::FloatZone {
+                    top_y: table_top_y + top_margin,
+                    bottom_y: table_bottom - bottom_margin,
+                    obj_left: table_left,
+                    obj_right: table_left + total_w,
+                    left_from_text: fp.left_from_text,
+                    right_from_text: fp.right_from_text,
+                    polygon_pts: None,
+                    wrap_text,
+                    para_relative: false,
+                    from_table: true,
+                };
+                let keeps_previous = pb.float_zone.as_ref().is_some_and(|prev| {
+                    prev.from_table && (zone.outside_column(area) || prev.covers(&zone))
+                });
+                if !keeps_previous {
+                    pb.float_zone = Some(zone);
+                }
+                if let Some(old) = preceding_float_zone
+                    && let Some(ref mut current) = pb.float_zone
+                    && (old.obj_left - current.obj_left).abs() < 0.5
+                    && (old.obj_right - current.obj_right).abs() < 0.5
+                {
+                    current.top_y = current.top_y.max(old.top_y);
+                    current.bottom_y = current.bottom_y.min(old.bottom_y);
+                    current.left_from_text = current.left_from_text.max(old.left_from_text);
+                    current.right_from_text = current.right_from_text.max(old.right_from_text);
+                }
+                if let Some(old) = overlapped_table_zone
+                    && pb
+                        .float_zone
+                        .as_ref()
+                        .is_some_and(|z| old.bottom_y < z.bottom_y)
+                {
+                    pb.float_zone = Some(old);
+                }
+            }
+        }
+    }
+}
+
+/// The column widths a header or footer table is drawn with in a text column
+/// `content_w` wide. A header's auto-fit table sizes to its content like a
+/// body table (issue #142: Word shrinks the same two-word table to 64pt in
+/// both places; without the fill target the header one kept its 396pt grid).
+pub(super) fn hf_col_widths(table: &Table, ctx: &RenderContext, content_w: f32) -> Vec<f32> {
+    let mut col_widths = auto_fit_columns(
+        table,
+        ctx.fonts,
+        None,
+        Some(content_w),
+        table.autofit_overhang(ctx.compat_mode),
+    );
+    apply_pct_width(table, &mut col_widths, content_w, ctx.compat_mode);
+    col_widths
+}
+
+pub(super) fn compute_hf_table_height(table: &Table, ctx: &RenderContext, content_w: f32) -> f32 {
+    hf_rows_height(table, &hf_col_widths(table, ctx, content_w), ctx)
+}
+
+/// A header or footer table's rows' height at its `col_widths`.
+pub(super) fn hf_rows_height(table: &Table, col_widths: &[f32], ctx: &RenderContext) -> f32 {
+    compute_row_layouts(table, col_widths, ctx, None)
+        .iter()
+        .map(|r| r.height)
+        .sum()
+}
+
+pub(super) fn render_header_footer_table(
+    table: &Table,
+    sp: &SectionProperties,
+    ctx: &RenderContext,
+    content: &mut Content,
+    cursor_y: &mut f32,
+    page_num: usize,
+    total_pages: usize,
+    section_pages: usize,
+    styleref_values: &HashMap<String, String>,
+    page_num_format: Option<&str>,
+    gradient_specs: &mut Vec<super::GradientSpec>,
+    links: &mut Vec<LinkAnnotation>,
+    is_header: bool,
+) {
+    let col_widths = hf_col_widths(table, ctx, sp.text_width());
+    let hf_sub = HfSubstitution {
+        page_num,
+        total_pages,
+        section_pages,
+        styleref_values,
+        page_num_format,
+    };
+    let row_layouts = compute_row_layouts(table, &col_widths, ctx, Some(&hf_sub));
+    // A floating table sits at its own position and leaves the header's flow
+    // alone (french_sexual: the logo paragraph after it starts at the header top).
+    let mut float_y: f32;
+    let (table_left, y) = if let Some(pos) = &table.position {
+        let fp = super::FloatingTablePos::resolve(
+            table,
+            pos,
+            sp,
+            sp.margin_left,
+            sp.text_width(),
+            *cursor_y,
+            ctx,
+        );
+        float_y = fp.y;
+        (fp.x, &mut float_y)
+    } else {
+        let total_w: f32 = col_widths.iter().sum();
+        let area = (sp.margin_left, sp.text_width());
+        (
+            aligned_table_left(table, area, total_w, ctx.compat_mode),
+            cursor_y,
+        )
+    };
+
+    let merge_spans = compute_merge_spans(table, &row_layouts);
+
+    // A header table's outer border bands sit inside the flow, as in the
+    // body: Word starts header-autofit-table's top band at the header
+    // margin. A footer table's do not: nabl's bottom rule is centred on the
+    // footer margin and its text matched Word without them.
+    let (top_band, bottom_band) = if is_header {
+        super::table_layout::outer_half_bands(table)
+    } else {
+        (0.0, 0.0)
+    };
+    *y -= top_band;
+    render_table_rows(
+        table,
+        &row_layouts,
+        &col_widths,
+        table_left,
+        &merge_spans,
+        content,
+        y,
+        ctx,
+        gradient_specs,
+        links,
+        None,
+        0..usize::MAX,
+        Some(&hf_sub),
+        None,
+    );
+    *y -= bottom_band;
+    // ponytail: header/footer cells get no balloons (the pane anchors body text only).
+    ctx.cell_comment_anchors.borrow_mut().clear();
+}
+
+/// A table in a text box lays out like a top-level one in a text column as
+/// wide as the box's text area: Word fits auto and percentage widths to that
+/// area, squeezing an auto-width table's wider grid into it down to its
+/// longest words, and lets a fixed or dxa grid run past it.
+pub(super) struct TextboxTable<'t> {
+    table: &'t Table,
+    col_widths: Vec<f32>,
+    rows: Vec<RowLayout>,
+}
+
+impl<'t> TextboxTable<'t> {
+    pub(super) fn layout(
+        table: &'t Table,
+        area_w: f32,
+        ctx: &RenderContext,
+        hf_sub: Option<&HfSubstitution>,
+    ) -> Self {
+        let mut col_widths = if table.fixed_layout {
+            table.col_widths.clone()
+        } else {
+            let mut widths = auto_fit_columns(
+                table,
+                ctx.fonts,
+                None,
+                Some(area_w),
+                table.autofit_overhang(ctx.compat_mode),
+            );
+            if table.auto_width {
+                // Columns keep their longest word and widest picture: a table
+                // that cannot shrink enough runs past the area.
+                let min = autofit_min_widths(table, ctx.fonts);
+                for (w, m) in widths.iter_mut().zip(&min) {
+                    *w = w.max(*m);
+                }
+                let floor: f32 = min.iter().sum();
+                squeeze_to_width(&mut widths, &min, area_w.max(floor));
+            }
+            widths
+        };
+        apply_pct_width(table, &mut col_widths, area_w, ctx.compat_mode);
+        let rows = compute_row_layouts(table, &col_widths, ctx, hf_sub);
+        Self {
+            table,
+            col_widths,
+            rows,
+        }
+    }
+
+    pub(super) fn height(&self) -> f32 {
+        let rows: f32 = self.rows.iter().map(|r| r.height).sum();
+        rows + (outer_band(self.table.rows.first(), true)
+            + outer_band(self.table.rows.last(), false))
+            / 2.0
+    }
+
+    /// Draws the table from `cursor_y` down in the text area `area`, tagged
+    /// as a Table in `tag`'s Sect.
+    pub(super) fn render(
+        &self,
+        area: (f32, f32),
+        cursor_y: &mut f32,
+        content: &mut Content,
+        ctx: &RenderContext,
+        gradient_specs: &mut Vec<super::GradientSpec>,
+        links: &mut Vec<LinkAnnotation>,
+        tag: Option<super::textbox_render::StoryTag>,
+        hf_sub: Option<&HfSubstitution>,
+    ) {
+        let total_w: f32 = self.col_widths.iter().sum();
+        let left = aligned_table_left(self.table, area, total_w, ctx.compat_mode);
+        let merge_spans = compute_merge_spans(self.table, &self.rows);
+        *cursor_y -= outer_band(self.table.rows.first(), true) / 2.0;
+        // ponytail: no comment balloons for text box cells; an enclosing
+        // table keeps the anchors it collected.
+        let anchors = ctx.cell_comment_anchors.borrow().len();
+        let mut draw = |tag| {
+            render_table_rows(
+                self.table,
+                &self.rows,
+                &self.col_widths,
+                left,
+                &merge_spans,
+                content,
+                cursor_y,
+                ctx,
+                gradient_specs,
+                links,
+                tag,
+                0..usize::MAX,
+                hf_sub,
+                None,
+            )
+        };
+        match tag {
+            Some(super::textbox_render::StoryTag { tags, page, sect }) => {
+                let mut table_tags = TableTags::for_table(tags, sect, self.table);
+                draw(Some((&mut *tags, &mut table_tags, page)));
+                table_tags.finish(tags);
+            }
+            None => draw(None),
+        }
+        ctx.cell_comment_anchors.borrow_mut().truncate(anchors);
+        *cursor_y -= outer_band(self.table.rows.last(), false) / 2.0;
+    }
+}
+
+/// Moves the anchors the cell renderers collected onto the page, merging a
+/// comment that spans cells into one anchor at its last piece.
+fn move_cell_comment_anchors(ctx: &RenderContext, page: &mut Vec<(u32, f32, f32, f32)>) {
+    for a in ctx.cell_comment_anchors.borrow_mut().drain(..) {
+        match page.iter_mut().find(|p| p.0 == a.0) {
+            Some(p) => *p = a,
+            None => page.push(a),
+        }
+    }
+}
+
+#[cfg(test)]
+mod floating_nested_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn zero_flow_height_does_not_hide_nested_fields() {
+        let items = vec![CellContentItem::NestedTable {
+            col_widths: vec![80.0],
+            rows: vec![RowLayout {
+                height: 12.0,
+                cells: vec![],
+                split_min: None,
+                keeps_next: false,
+            }],
+            space_before: 0.0,
+            floating_offset: Some(0.0),
+            floating_x_offset: None,
+            bottom_band: 0.0,
+        }];
+        assert_eq!(items[0].height(), 0.0);
+        assert!(cell_has_visible_content(&items));
+    }
+}

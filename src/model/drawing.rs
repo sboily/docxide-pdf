@@ -1,0 +1,527 @@
+use std::sync::Arc;
+
+use crate::geometry::PathFill;
+
+use super::{
+    HRelativeFrom, HorizontalPosition, Paragraph, Table, VRelativeFrom, VerticalPosition, WrapText,
+    WrapType,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ImageFormat {
+    Jpeg,
+    Png,
+    Bmp,
+    /// Enhanced Metafile — a vector graphics format. Embedded as a PDF Form
+    /// XObject (PDF drawing operators) rather than a raster Image XObject.
+    Emf,
+    /// SVG picture (`asvg:svgBlip`), drawn as a Form XObject like an EMF.
+    Svg,
+}
+
+#[derive(Clone)]
+pub struct EmbeddedImage {
+    /// Identity of the drawing, the key of the image name maps. Drawings of one
+    /// media part share their `data`, so it is not the data pointer.
+    pub id: usize,
+    /// Preview of an actual Office OLE object, not an ordinary or static VML picture.
+    pub is_ole_preview: bool,
+    /// `wp:docPr/@descr`, which Word exports as the Figure's /Alt.
+    pub alt: Option<String>,
+    /// Marked decorative in Word (Office 2019+): an artifact, not a Figure.
+    pub decorative: bool,
+    pub data: Arc<Vec<u8>>,
+    pub format: ImageFormat,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub display_width: f32,
+    pub display_height: f32,
+    pub trimmed_width: f32,
+    /// effectExtent's left side: the picture sits this far into its box.
+    pub effect_left: f32,
+    pub jpeg_components: u8,
+    /// effectExtent + distT/distB combined (points)
+    pub layout_extra_height: f32,
+    /// effectExtent.t + distT (points)
+    pub layout_extra_top: f32,
+    pub stroke_color: Option<[u8; 3]>,
+    pub stroke_width: f32,
+    pub shadow: Option<ImageShadow>,
+    pub soft_edge: Option<SoftEdge>,
+    pub glow: Option<ImageGlow>,
+    pub inner_shadow: Option<InnerShadow>,
+    pub reflection: Option<ImageReflection>,
+    /// Non-rectangular clip shape (e.g. "ellipse"). None means standard rect (no clipping).
+    pub clip_geometry: Option<ShapeGeometry>,
+    /// `a:srcRect` crop as (left, top, right, bottom) fractions of the source image.
+    /// None when the picture is uncropped. Negative values pad the frame with blank space.
+    pub src_rect: Option<[f32; 4]>,
+    /// `a:lum` picture recolouring as (brightness, contrast) fractions of ±1.0.
+    /// None when both are zero. Applied to the decoded pixels at embed time, so
+    /// only raster formats honour it; an EMF keeps its colours.
+    pub lum: Option<(f32, f32)>,
+    /// `a:duotone` (or `a:grayscl`, black to white) on the blip: each pixel's
+    /// luminance picks a colour on the ramp from the first to the second.
+    /// Applied to the decoded pixels like `lum`.
+    pub recolor: Option<([u8; 3], [u8; 3])>,
+    /// `a:alphaModFix` below 1: the picture's opacity. Word bakes it into an
+    /// SMask, as we do.
+    pub alpha: Option<f32>,
+    /// In-plane rotation in degrees, clockwise (OOXML convention). Sourced from
+    /// `a:xfrm @rot` or a 3D scene camera `a:scene3d/a:camera/a:rot @rev`.
+    /// Applied as a rotation about the picture's center at render time.
+    pub rotation_deg: f32,
+}
+
+impl EmbeddedImage {
+    /// Whether `lum` or `recolor` change the decoded colours.
+    pub fn recolored(&self) -> bool {
+        self.lum.is_some() || self.recolor.is_some()
+    }
+
+    /// The width Word lays the picture out at: the drawn width plus its
+    /// whole-twip trim.
+    pub fn box_width(&self) -> f32 {
+        self.display_width + self.trimmed_width
+    }
+
+    /// Size of the box an inline picture occupies in the line: the bounding box of
+    /// the rotated frame. Word gives the 56×108pt signature turned -90° on
+    /// italian_evaluation_minutes p7 a 56pt line, not 108pt.
+    pub fn layout_size(&self) -> (f32, f32) {
+        let (sin, cos) = self.rotation_deg.to_radians().sin_cos();
+        let (s, c) = (sin.abs(), cos.abs());
+        let w = self.box_width();
+        (
+            w * c + self.display_height * s,
+            w * s + self.display_height * c,
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ImageShadow {
+    pub offset_x: f32,    // points, positive = right
+    pub offset_y: f32,    // points, positive = down (screen coords, not PDF)
+    pub blur_radius: f32, // points
+    pub color: [u8; 3],
+    pub alpha: f32, // 0.0–1.0
+}
+
+#[derive(Clone, Debug)]
+pub struct SoftEdge {
+    pub radius: f32, // points
+}
+
+#[derive(Clone, Debug)]
+pub struct ImageGlow {
+    pub radius: f32, // points
+    pub color: [u8; 3],
+    pub alpha: f32, // 0.0–1.0
+}
+
+#[derive(Clone, Debug)]
+pub struct InnerShadow {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur_radius: f32,
+    pub color: [u8; 3],
+    pub alpha: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImageReflection {
+    pub start_alpha: f32, // 0.0–1.0
+    pub end_alpha: f32,   // 0.0–1.0
+    pub distance: f32,    // points (gap between image and reflection)
+    /// Fraction of image height visible in the reflection (0.0–1.0). 1.0 = full image.
+    pub end_pos: f32,
+}
+
+#[derive(Clone)]
+pub struct FloatingImage {
+    pub image: EmbeddedImage,
+    pub h_position: HorizontalPosition,
+    pub h_relative_from: HRelativeFrom,
+    pub v_position: VerticalPosition,
+    pub v_relative_from: VRelativeFrom,
+    pub wrap_type: WrapType,
+    pub wrap_text: WrapText,
+    /// Vertices in 1/21600 of extent (OOXML wrapPolygon coordinate space)
+    pub wrap_polygon: Option<Vec<(i32, i32)>>,
+    pub behind_doc: bool,
+    pub dist_top: f32,
+    pub dist_bottom: f32,
+    pub dist_left: f32,
+    pub dist_right: f32,
+    /// OOXML wp:anchor @relativeHeight — the z-order among foreground floating
+    /// objects. Higher draws on top. Used to composite foreground floating
+    /// images into the same z-stack as textboxes/connectors.
+    pub z_index: u32,
+    /// Position among the paragraph's floating pictures and textboxes in XML
+    /// order: their tags follow the anchors' order, not the drawing order.
+    pub anchor_seq: u32,
+    /// The picture anchor precedes visible text and explicit breaks in this paragraph.
+    pub anchor_at_start: bool,
+    /// Index of the paragraph run the anchor sits in front of: the float
+    /// belongs to the page that run's line lands on.
+    pub anchor_run: usize,
+    /// Flattened from an inline canvas: its offset counts from the line top,
+    /// as for `Textbox::on_line`.
+    pub on_line: bool,
+    /// Positioned `relativeFrom="line"` (kept as `VRelativeFrom::Paragraph`):
+    /// see `Textbox::v_from_line`.
+    pub v_from_line: bool,
+}
+
+/// Covers all 187 OOXML preset shapes and arbitrary custom geometry (a:custGeom).
+#[derive(Clone, Debug)]
+pub struct ShapeGeometry {
+    pub preset: Option<String>,
+    pub adjustments: Vec<(String, i64)>,
+    pub custom: Option<CustomGeometry>,
+}
+
+impl Default for ShapeGeometry {
+    fn default() -> Self {
+        Self {
+            preset: Some("rect".to_string()),
+            adjustments: Vec::new(),
+            custom: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CustomGeometry {
+    pub adjust_defaults: Vec<(String, i64)>,
+    pub guides: Vec<CustomGuideDef>,
+    pub paths: Vec<CustomPathDef>,
+}
+
+pub type CustomGuideDef = crate::geometry::GuideDef<String>;
+
+#[derive(Clone, Debug)]
+pub struct CustomPathDef {
+    pub commands: Vec<CustomPathCommand>,
+    pub w: Option<i64>,
+    pub h: Option<i64>,
+    pub fill: PathFill,
+    pub stroke: bool,
+}
+
+pub type CustomPathCommand = crate::geometry::PathCommandDef<String>;
+
+#[derive(Clone, Copy, Default)]
+pub enum SmartArtTextAnchor {
+    #[default]
+    Top,
+    Center,
+    Bottom,
+}
+
+#[derive(Clone, Copy, Default)]
+pub enum SmartArtTextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+pub struct SmartArtRun {
+    pub text: String,
+    pub font_name: Option<String>,
+    pub font_size: f32,
+    pub bold: bool,
+    pub italic: bool,
+    pub color: Option<[u8; 3]>,
+    pub underline: bool,
+    pub strikethrough: bool,
+    /// Baseline shift in 1000ths of %. >0 = superscript, <0 = subscript.
+    pub baseline: i32,
+    pub highlight: Option<[u8; 3]>,
+}
+
+pub struct SmartArtPara {
+    pub runs: Vec<SmartArtRun>,
+    pub bullet: Option<String>,
+    pub align: SmartArtTextAlign,
+    /// Line spacing as a multiplier (e.g. 0.9 for 90%). 0.0 = use default 1.2.
+    pub line_spacing_pct: f32,
+}
+
+pub struct SmartArtShape {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// Rotation in degrees (clockwise in OOXML, converted for PDF)
+    pub rotation_deg: f32,
+    pub shape_type: ShapeGeometry,
+    pub fill: Option<[u8; 3]>,
+    pub image_fill: Option<EmbeddedImage>,
+    pub stroke_color: Option<[u8; 3]>,
+    pub stroke_width: f32,
+    pub paragraphs: Vec<SmartArtPara>,
+    /// Separate text rectangle from dsp:txXfrm (x, y, w, h in pts)
+    pub text_rect: Option<(f32, f32, f32, f32)>,
+    /// Body insets from a:bodyPr (top, right, bottom, left) in pts
+    pub text_insets: (f32, f32, f32, f32),
+    pub text_anchor: SmartArtTextAnchor,
+}
+
+pub struct SmartArtDiagram {
+    pub display_height: f32,
+    pub shapes: Vec<SmartArtShape>,
+    /// Where a floating (wrapNone) diagram sits; None when it is inline.
+    pub anchor: Option<DiagramAnchor>,
+}
+
+pub struct DiagramAnchor {
+    pub h_position: HorizontalPosition,
+    pub h_relative_from: HRelativeFrom,
+    pub v_position: VerticalPosition,
+    pub v_relative_from: VRelativeFrom,
+    pub width: f32,
+    /// wp:anchor relativeHeight, as for connectors.
+    pub z_index: u32,
+}
+
+#[derive(Clone)]
+pub enum ConnectorType {
+    Line {
+        flip_h: bool,
+        flip_v: bool,
+    },
+    Arc {
+        start_angle: f32,
+        end_angle: f32,
+        rotation: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ArrowEnd {
+    #[default]
+    None,
+    Arrow,
+    Triangle,
+    Stealth,
+    Diamond,
+    Oval,
+}
+
+impl ArrowEnd {
+    pub fn from_attr(s: &str) -> Self {
+        match s {
+            "triangle" => Self::Triangle,
+            "stealth" => Self::Stealth,
+            "diamond" => Self::Diamond,
+            "oval" => Self::Oval,
+            "arrow" => Self::Arrow,
+            _ => Self::None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ConnectorShape {
+    /// Anchored connector belongs behind paragraph text and inline pictures.
+    pub behind_doc: bool,
+    /// The anchor's position and the frame it is measured from: a page- or
+    /// margin-anchored line must not follow its paragraph.
+    pub h_position: HorizontalPosition,
+    pub h_relative_from: HRelativeFrom,
+    pub v_position: VerticalPosition,
+    pub v_relative_from: VRelativeFrom,
+    pub width: f32,
+    pub height: f32,
+    pub stroke_color: [u8; 3],
+    pub stroke_width: f32,
+    pub connector_type: ConnectorType,
+    pub head_end: ArrowEnd,
+    pub tail_end: ArrowEnd,
+    /// wp:anchor relativeHeight — stacking order among overlapping anchored
+    /// shapes within a page (higher draws on top). 0 when unspecified.
+    pub z_index: u32,
+    /// See `Textbox::v_from_line`.
+    pub v_from_line: bool,
+    /// Flattened from an inline canvas, as for `Textbox::on_line`.
+    pub on_line: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+pub enum TextAnchor {
+    #[default]
+    Top,
+    Middle,
+    Bottom,
+}
+
+pub enum ShapeFill {
+    Solid([u8; 3]),
+    LinearGradient {
+        stops: Vec<([u8; 3], f32)>,
+        angle_deg: f32,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct TextWarp {
+    pub preset: String,
+    pub adjustments: Vec<(String, i64)>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum AutoFit {
+    #[default]
+    None,
+    Normal,
+    Shape,
+}
+
+#[derive(Default)]
+pub struct Textbox {
+    pub paragraphs: Vec<Paragraph>,
+    /// The tables of the box's story, each with the index of the paragraph
+    /// it comes before.
+    pub tables: Vec<(usize, Table)>,
+    pub width_pt: f32,
+    /// `wp14:sizeRelH relativeFrom="margin"` pctWidth as a fraction: the
+    /// width is that share of the section's text width (resolved into
+    /// `width_pt` once the section is known).
+    pub width_pct_margin: Option<f32>,
+    pub height_pt: f32,
+    pub h_position: HorizontalPosition,
+    pub h_relative_from: HRelativeFrom,
+    /// Resolved offset for paths that need a single f32 (content-height
+    /// reservation, paragraph-relative tb_y_top). For `AlignTop/Center/Bottom`
+    /// this is 0 — the alignment is preserved in `v_position`, which the
+    /// y_top resolver consults when it has the section dimensions.
+    pub v_offset_pt: f32,
+    /// Full vertical anchoring intent. `Offset(o)` matches `v_offset_pt = o`;
+    /// the `AlignTop`/`AlignCenter`/`AlignBottom` variants need section
+    /// geometry to compute their final y, which the renderer does.
+    pub v_position: VerticalPosition,
+    pub v_relative_from: VRelativeFrom,
+    pub fill: Option<ShapeFill>,
+    /// `a:blipFill`: the picture stretched over the shape, under its text.
+    pub picture_fill: Option<EmbeddedImage>,
+    pub shape_type: ShapeGeometry,
+    pub stroke_color: Option<[u8; 3]>,
+    pub stroke_width: f32,
+    /// `a:prstDash` as dash/gap lengths in line widths; empty for a solid line.
+    pub stroke_dash: &'static [f32],
+    pub text_anchor: TextAnchor,
+    pub margin_left: f32,
+    pub margin_right: f32,
+    pub margin_top: f32,
+    pub margin_bottom: f32,
+    pub wrap_type: WrapType,
+    pub wrap_text: WrapText,
+    /// Vertices in 1/21600 of extent (wrapTight / wrapThrough polygon).
+    pub wrap_polygon: Option<Vec<(i32, i32)>>,
+    /// Wrap distances (points), effectExtent included like a picture's.
+    pub dist_top: f32,
+    pub dist_bottom: f32,
+    pub dist_left: f32,
+    pub dist_right: f32,
+    pub behind_doc: bool,
+    pub no_text_wrap: bool,
+    pub text_warp: Option<TextWarp>,
+    pub auto_fit: AutoFit,
+    /// wp:anchor relativeHeight — stacking order among overlapping anchored
+    /// shapes within a paragraph (higher draws on top). 0 when unspecified.
+    pub z_index: u32,
+    /// See `FloatingImage::anchor_seq`.
+    pub anchor_seq: u32,
+    /// Sits on the line rather than hanging from a paragraph anchor: children
+    /// flattened from an *inline* drawing canvas, and inline text boxes. They
+    /// flow at the paragraph's text-start, so their Column-relative x includes
+    /// the paragraph's left indent, and their offsets count from the line top
+    /// below the space before. Genuine anchored floats do neither.
+    pub on_line: bool,
+    /// Positioned `relativeFrom="line"`, kept as `VRelativeFrom::Paragraph`:
+    /// the offset counts from where the paragraph flowed, also when a band or
+    /// floating table pushed it down and its paragraph-relative drawings
+    /// stay where it stood.
+    pub v_from_line: bool,
+    /// In-plane rotation in degrees, clockwise (OOXML / VML `rotation:`),
+    /// applied about the box centre at render time.
+    pub rotation_deg: f32,
+    /// VML `fitshape`: the warped glyphs stretch to the box width as well as
+    /// its height (a DrawingML warp keeps the text's natural width, centred).
+    pub fit_shape: bool,
+    /// A box in a linked chain (`wps:txbx id` / `wps:linkedTxbx id seq`).
+    pub link: Option<TextboxLink>,
+    /// `a:effectLst` glow and reflection on the shape.
+    pub glow: Option<ImageGlow>,
+    pub reflection: Option<ImageReflection>,
+    /// A shape of a DrawingML group or drawing canvas: Word clips its pictures
+    /// to the box's left and right edges, not to the text area inside the
+    /// insets as for a standalone box.
+    pub in_group: bool,
+}
+
+impl Textbox {
+    /// The paragraphs this box carries: a linked chain's story belongs to its
+    /// first box.
+    pub fn content(&self) -> &[crate::model::Paragraph] {
+        match self.first_of_chain() {
+            Some(link) => &link.story,
+            None => &self.paragraphs,
+        }
+    }
+
+    /// The tables among `content()`, each with the index of the paragraph it
+    /// comes before.
+    pub fn content_tables(&self) -> &[(usize, Table)] {
+        match self.first_of_chain() {
+            Some(link) => &link.tables,
+            None => &self.tables,
+        }
+    }
+
+    fn first_of_chain(&self) -> Option<&TextboxLink> {
+        self.link
+            .as_ref()
+            .filter(|link| link.before.is_empty() && !link.story.is_empty())
+    }
+
+    /// The paragraphs in the cells of the box's tables, at any depth.
+    pub fn table_paragraphs(&self) -> Vec<&Paragraph> {
+        self.content_tables()
+            .iter()
+            .flat_map(|(_, t)| t.all_paragraphs())
+            .collect()
+    }
+
+    /// How far below its anchor's top the box reaches, with its wrap distance.
+    pub fn flow_bottom(&self) -> f32 {
+        self.v_offset_pt + self.height_pt + self.dist_bottom
+    }
+
+    /// The (width, height) inside the body margins of a box `height` tall.
+    pub fn text_area(&self, height: f32) -> (f32, f32) {
+        (
+            self.width_pt - self.margin_left - self.margin_right,
+            height - self.margin_top - self.margin_bottom,
+        )
+    }
+}
+
+/// Linked text boxes share one story: every box in the chain shows what the
+/// boxes before it could not hold.
+#[derive(Default)]
+pub struct TextboxLink {
+    pub id: u32,
+    pub seq: u32,
+    /// The chain's paragraphs (filled in once the document is parsed).
+    pub story: Arc<Vec<crate::model::Paragraph>>,
+    /// The story's tables, each with the index of the paragraph it comes before.
+    pub tables: Arc<Vec<(usize, Table)>>,
+    /// The text areas (width, height) of the boxes before this one.
+    pub before: Vec<(f32, f32)>,
+    /// A later box takes the overflow, so this one shows only what fits.
+    pub continues: bool,
+}

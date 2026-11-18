@@ -1,0 +1,407 @@
+use std::collections::HashMap;
+use std::io::{Read, Seek};
+
+use crate::model::{
+    BarGrouping, BarShape, Chart, ChartAxis, ChartLegend, ChartSeries, ChartType, InlineChart,
+    LegendPosition, MarkerSymbol, View3D,
+};
+
+use super::{
+    CHART_NS, DML_NS, chart_ns as chart_child, chart_ns_attr as chart_attr,
+    chart_ns_children as chart_children, dml as dml_child, frac_attr, parse_hex_color, part_path,
+    read_zip_text,
+};
+
+fn find_srgb_clr<'a>(sp_pr: roxmltree::Node<'a, 'a>) -> Option<roxmltree::Node<'a, 'a>> {
+    dml_child(dml_child(sp_pr, "solidFill")?, "srgbClr")
+}
+
+fn extract_srgb_fill(sp_pr: roxmltree::Node) -> Option<[u8; 3]> {
+    find_srgb_clr(sp_pr)?
+        .attribute("val")
+        .and_then(parse_hex_color)
+}
+
+fn extract_fill_alpha(sp_pr: roxmltree::Node) -> Option<f32> {
+    let alpha_node = dml_child(find_srgb_clr(sp_pr)?, "alpha")?;
+    frac_attr(alpha_node, "val")
+}
+
+fn extract_line_color(sp_pr: roxmltree::Node) -> Option<[u8; 3]> {
+    let ln = dml_child(sp_pr, "ln")?;
+    if dml_child(ln, "noFill").is_some() {
+        return None;
+    }
+    extract_srgb_fill(ln)
+}
+
+fn collect_indexed_pts<T: Clone>(
+    cache_node: roxmltree::Node,
+    default: T,
+    extract: impl Fn(roxmltree::Node) -> Option<T>,
+) -> Vec<T> {
+    let pts: Vec<(usize, T)> = chart_children(cache_node, "pt")
+        .filter_map(|pt| {
+            let idx = pt.attribute("idx")?.parse::<usize>().ok()?;
+            let v = extract(pt)?;
+            Some((idx, v))
+        })
+        .collect();
+    let count = pts.iter().map(|(idx, _)| idx + 1).max().unwrap_or(0);
+    let mut values = vec![default; count];
+    for (idx, v) in pts {
+        values[idx] = v;
+    }
+    values
+}
+
+fn parse_num_cache(parent: roxmltree::Node, child_name: &str) -> (Vec<f32>, Option<String>) {
+    let num_cache = chart_child(parent, child_name)
+        .and_then(|c| chart_child(c, "numRef"))
+        .and_then(|nr| chart_child(nr, "numCache"));
+    let Some(num_cache) = num_cache else {
+        return (Vec::new(), None);
+    };
+    let format_code = chart_child(num_cache, "formatCode")
+        .and_then(|n| n.text())
+        .map(str::to_string)
+        .filter(|s| s != "General");
+    let values = collect_indexed_pts(num_cache, 0.0, |pt| {
+        chart_child(pt, "v")?.text()?.parse::<f32>().ok()
+    });
+    (values, format_code)
+}
+
+fn parse_str_cache(container: Option<roxmltree::Node>) -> Vec<String> {
+    let str_cache = container
+        .and_then(|c| chart_child(c, "strRef"))
+        .and_then(|sr| chart_child(sr, "strCache"));
+    let Some(str_cache) = str_cache else {
+        return Vec::new();
+    };
+    collect_indexed_pts(str_cache, String::new(), |pt| {
+        chart_child(pt, "v")?.text().map(str::to_string)
+    })
+}
+
+fn parse_marker_symbol(val: &str) -> Option<MarkerSymbol> {
+    match val {
+        "circle" => Some(MarkerSymbol::Circle),
+        "square" => Some(MarkerSymbol::Square),
+        "diamond" => Some(MarkerSymbol::Diamond),
+        "triangle" => Some(MarkerSymbol::Triangle),
+        "plus" => Some(MarkerSymbol::Plus),
+        "star" => Some(MarkerSymbol::Star),
+        "x" => Some(MarkerSymbol::X),
+        "dash" => Some(MarkerSymbol::Dash),
+        "dot" => Some(MarkerSymbol::Dot),
+        "none" => Some(MarkerSymbol::None),
+        _ => None,
+    }
+}
+
+fn parse_series(ser_node: roxmltree::Node) -> (ChartSeries, Vec<String>, Option<String>) {
+    let label = chart_child(ser_node, "tx")
+        .and_then(|tx| chart_child(tx, "strRef"))
+        .and_then(|sr| chart_child(sr, "strCache"))
+        .and_then(|cache| chart_child(cache, "pt"))
+        .and_then(|pt| chart_child(pt, "v"))
+        .and_then(|v| v.text())
+        .unwrap_or("")
+        .to_string();
+
+    let marker_node = chart_child(ser_node, "marker");
+
+    let sp_pr = chart_child(ser_node, "spPr");
+    let color = sp_pr
+        .and_then(extract_srgb_fill)
+        .or_else(|| sp_pr.and_then(extract_line_color))
+        .or_else(|| {
+            marker_node
+                .and_then(|m| chart_child(m, "spPr"))
+                .and_then(extract_srgb_fill)
+        });
+    let fill_alpha = sp_pr.and_then(extract_fill_alpha);
+
+    let marker = marker_node
+        .and_then(|m| chart_attr(m, "symbol"))
+        .and_then(parse_marker_symbol);
+    let marker_sp_pr = marker_node.and_then(|m| chart_child(m, "spPr"));
+    let ln_width = |sp_pr: Option<roxmltree::Node>| {
+        sp_pr
+            .and_then(|s| dml_child(s, "ln"))
+            .and_then(|ln| ln.attribute("w"))
+            .and_then(|w| w.parse::<f32>().ok())
+            .map(|emu| emu / 12700.0)
+    };
+
+    // Scatter/bubble use yVal instead of val
+    let (y_vals, y_fmt) = parse_num_cache(ser_node, "yVal");
+    let (values, val_fmt) = if !y_vals.is_empty() {
+        (y_vals, y_fmt)
+    } else {
+        parse_num_cache(ser_node, "val")
+    };
+
+    let (x_values_raw, _) = parse_num_cache(ser_node, "xVal");
+    let x_values = Some(x_values_raw).filter(|v| !v.is_empty());
+    let (bubble_raw, _) = parse_num_cache(ser_node, "bubbleSize");
+    let bubble_sizes = Some(bubble_raw).filter(|v| !v.is_empty());
+
+    let cat_labels = parse_str_cache(chart_child(ser_node, "cat"));
+
+    (
+        ChartSeries {
+            label,
+            color,
+            fill_alpha,
+            values,
+            x_values,
+            bubble_sizes,
+            marker,
+            line_width: ln_width(sp_pr),
+            marker_size: marker_node
+                .and_then(|m| chart_attr(m, "size"))
+                .and_then(|v| v.parse().ok()),
+            marker_color: marker_sp_pr.and_then(extract_srgb_fill),
+            marker_line_width: ln_width(marker_sp_pr),
+        },
+        cat_labels,
+        val_fmt,
+    )
+}
+
+fn parse_axis(ax_node: roxmltree::Node) -> ChartAxis {
+    // Lines with no `c:spPr` of their own draw black (the probes' 2-D and
+    // 3-D charts, torture_test).
+    const UNSTYLED: [u8; 3] = [0, 0, 0];
+    let gridline_color = chart_child(ax_node, "majorGridlines")
+        .and_then(|gl| chart_child(gl, "spPr").map_or(Some(UNSTYLED), extract_line_color));
+
+    let line_color = chart_child(ax_node, "spPr").map_or(Some(UNSTYLED), extract_line_color);
+
+    ChartAxis {
+        labels: Vec::new(),
+        gridline_color,
+        line_color,
+    }
+}
+
+/// `legendPos` (charts) and `pos` (chartEx) share the codes; only the default differs.
+pub(super) fn legend_position(code: Option<&str>, default: LegendPosition) -> LegendPosition {
+    match code {
+        Some("b") => LegendPosition::Bottom,
+        Some("t") => LegendPosition::Top,
+        Some("l") => LegendPosition::Left,
+        Some("r") => LegendPosition::Right,
+        _ => default,
+    }
+}
+
+fn collect_series(type_node: roxmltree::Node) -> (Vec<ChartSeries>, Vec<String>, Option<String>) {
+    let mut series_list = Vec::new();
+    let mut cat_labels = Vec::new();
+    let mut val_format_code = None;
+    for ser_node in chart_children(type_node, "ser") {
+        let (series, labels, fmt) = parse_series(ser_node);
+        if cat_labels.is_empty() && !labels.is_empty() {
+            cat_labels = labels;
+        }
+        if val_format_code.is_none() {
+            val_format_code = fmt;
+        }
+        series_list.push(series);
+    }
+    (series_list, cat_labels, val_format_code)
+}
+
+fn assign_cat_labels(cat_axis: &mut Option<ChartAxis>, cat_labels: Vec<String>) {
+    if let Some(ref mut ax) = *cat_axis {
+        if ax.labels.is_empty() {
+            ax.labels = cat_labels;
+        }
+    } else if !cat_labels.is_empty() {
+        *cat_axis = Some(ChartAxis {
+            labels: cat_labels,
+            gridline_color: None,
+            line_color: None,
+        });
+    }
+}
+
+fn parse_chart_space(xml_content: &str, accent_colors: Vec<[u8; 3]>) -> Option<Chart> {
+    let doc = roxmltree::Document::parse(xml_content).ok()?;
+    let chart_space = doc.root_element();
+    let chart_node = chart_child(chart_space, "chart")?;
+    let plot_area = chart_child(chart_node, "plotArea")?;
+
+    let (type_node, chart_type, gap_width_pct) = detect_chart_type(plot_area)?;
+
+    let (series_list, cat_labels, val_format_code) = collect_series(type_node);
+
+    // Scatter/bubble have two valAx; use first as cat_axis, second as val_axis
+    let (mut cat_axis, val_axis) = if matches!(chart_type, ChartType::Scatter | ChartType::Bubble) {
+        let val_axes: Vec<_> = chart_children(plot_area, "valAx").map(parse_axis).collect();
+        (val_axes.first().cloned(), val_axes.get(1).cloned())
+    } else {
+        (
+            chart_child(plot_area, "catAx").map(parse_axis),
+            chart_child(plot_area, "valAx").map(parse_axis),
+        )
+    };
+
+    assign_cat_labels(&mut cat_axis, cat_labels);
+
+    Some(Chart {
+        chart_type,
+        series: series_list,
+        cat_axis,
+        val_axis,
+        legend: chart_child(chart_node, "legend").map(|legend| ChartLegend {
+            position: legend_position(chart_attr(legend, "legendPos"), LegendPosition::Right),
+        }),
+        gap_width_pct,
+        plot_border_color: chart_child(plot_area, "spPr").and_then(extract_line_color),
+        accent_colors,
+        val_format_code,
+        title: chart_child(chart_node, "title")
+            .filter(|_| chart_attr(chart_node, "autoTitleDeleted") != Some("1"))
+            .map(|t| {
+                t.descendants()
+                    .filter(|n| n.has_tag_name((DML_NS, "t")))
+                    .filter_map(|n| n.text())
+                    .collect::<String>()
+            })
+            .filter(|t| !t.is_empty()),
+        show_values: type_node
+            .descendants()
+            .filter(|n| n.has_tag_name((CHART_NS, "dLbls")))
+            .any(|d| chart_attr(d, "showVal") == Some("1")),
+        data_table: chart_child(plot_area, "dTable").is_some(),
+        // Word's default outline draws grey 133 at 600 dpi (torture_test).
+        frame: chart_child(chart_space, "spPr").map_or(Some([0x85; 3]), extract_line_color),
+        view_3d: ["bar3DChart", "pie3DChart", "line3DChart", "area3DChart"]
+            .iter()
+            .any(|t| type_node.has_tag_name((CHART_NS, *t)))
+            .then(|| parse_view_3d(chart_node, plot_area, type_node)),
+        parent_labels: Vec::new(),
+        ex_text: None,
+    })
+}
+
+/// The spec's defaults: rotX 15, rotY 20, depthPercent 100, gapDepth 150.
+fn parse_view_3d(
+    chart_node: roxmltree::Node,
+    plot_area: roxmltree::Node,
+    type_node: roxmltree::Node,
+) -> View3D {
+    let view = chart_child(chart_node, "view3D");
+    let num = |node: Option<roxmltree::Node>, name, default| {
+        node.and_then(|n| chart_attr(n, name))
+            .and_then(|v| v.trim_end_matches('%').parse::<f32>().ok())
+            .unwrap_or(default)
+    };
+    View3D {
+        rot_x: num(view, "rotX", 15.0),
+        rot_y: num(view, "rotY", 20.0),
+        depth: num(view, "depthPercent", 100.0) / 100.0,
+        height: num(view, "hPercent", 100.0) / 100.0,
+        gap_depth: num(Some(type_node), "gapDepth", 150.0) / 100.0,
+        series_axis: chart_child(plot_area, "serAx")
+            .is_some_and(|ax| chart_attr(ax, "delete") != Some("1")),
+        // ponytail: lying bars keep the oblique view with rAngAx 0; no probe.
+        perspective: (view.and_then(|v| chart_attr(v, "rAngAx")) == Some("0")
+            && chart_attr(type_node, "barDir") != Some("bar"))
+        .then(|| num(view, "perspective", 30.0)),
+        shape: match chart_attr(type_node, "shape") {
+            Some("cylinder") => BarShape::Cylinder,
+            Some("cone") => BarShape::Cone,
+            Some("coneToMax") => BarShape::ConeToMax,
+            Some("pyramid") => BarShape::Pyramid,
+            Some("pyramidToMax") => BarShape::PyramidToMax,
+            _ => BarShape::Box,
+        },
+    }
+}
+
+fn detect_chart_type<'a>(
+    plot_area: roxmltree::Node<'a, 'a>,
+) -> Option<(roxmltree::Node<'a, 'a>, ChartType, f32)> {
+    if let Some(n) =
+        chart_child(plot_area, "barChart").or_else(|| chart_child(plot_area, "bar3DChart"))
+    {
+        let horizontal = chart_attr(n, "barDir") == Some("bar");
+        let grouping = match chart_attr(n, "grouping") {
+            Some("stacked") => BarGrouping::Stacked,
+            Some("percentStacked") => BarGrouping::PercentStacked,
+            Some("standard") if n.has_tag_name((CHART_NS, "bar3DChart")) => BarGrouping::Standard,
+            _ => BarGrouping::Clustered,
+        };
+        let gap_width_pct = chart_attr(n, "gapWidth")
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(150.0);
+        return Some((
+            n,
+            ChartType::Bar {
+                horizontal,
+                grouping,
+            },
+            gap_width_pct,
+        ));
+    }
+
+    let default_gap = 150.0;
+
+    if let Some(n) = chart_child(plot_area, "doughnutChart") {
+        let hole_size_pct = chart_attr(n, "holeSize")
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(50.0);
+        return Some((n, ChartType::Doughnut { hole_size_pct }, default_gap));
+    }
+
+    let simple_types: &[(&str, ChartType)] = &[
+        ("lineChart", ChartType::Line),
+        ("line3DChart", ChartType::Line),
+        ("pieChart", ChartType::Pie),
+        ("pie3DChart", ChartType::Pie),
+        ("areaChart", ChartType::Area),
+        ("area3DChart", ChartType::Area),
+        ("radarChart", ChartType::Radar),
+        ("scatterChart", ChartType::Scatter),
+        ("bubbleChart", ChartType::Bubble),
+    ];
+    for &(element, ref chart_type) in simple_types {
+        if let Some(n) = chart_child(plot_area, element) {
+            return Some((n, chart_type.clone(), default_gap));
+        }
+    }
+
+    None
+}
+
+pub(super) fn parse_chart_from_zip<R: Read + Seek>(
+    r_id: &str,
+    rels: &HashMap<String, String>,
+    zip: &mut zip::ZipArchive<R>,
+    display_w: f32,
+    display_h: f32,
+    theme: &super::styles::ThemeFonts,
+) -> Option<InlineChart> {
+    let accent_colors: Vec<[u8; 3]> = (1..=6)
+        .filter_map(|i| theme.colors.get(&format!("accent{i}")).copied())
+        .collect();
+    let part = part_path(rels.get(r_id)?);
+    let xml_content = read_zip_text(zip, &part)?;
+    let chart = if xml_content.contains(super::chartex::CHARTEX_NS) {
+        let style = super::relationships::related_part(zip, &part, "chartStyle")
+            .and_then(|p| read_zip_text(zip, &p));
+        super::chartex::parse_chartex_space(&xml_content, accent_colors, theme, style.as_deref())?
+    } else {
+        parse_chart_space(&xml_content, accent_colors)?
+    };
+    Some(InlineChart {
+        chart,
+        display_width: display_w,
+        display_height: display_h,
+    })
+}

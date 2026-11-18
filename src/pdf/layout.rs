@@ -1,0 +1,4995 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
+
+use crate::fonts::{FontEntry, font_key_buf};
+use crate::model::{
+    Alignment, FormCheckbox, ParagraphBorder, Run, TabAlignment, TabStop, TextFill, TextOutline,
+    TextShadow, VertAlign,
+};
+
+use super::RenderContext;
+use super::images::EffectXObjs;
+pub(super) use super::line_render::{
+    LineNumberArg, RenderOpts, change_bars_len, checkbox_cell, collapse_change_bars_from,
+    encode_text_for_pdf, os2_strike, post_underline, push_clip, record_change_bar,
+    render_paragraph_lines, set_change_bar_extension, show_visual, strike_line, take_change_bars,
+    underline_lines,
+};
+pub(super) use super::line_sizing::{
+    LineGrid, align_lines, boxed_line_ascent, descender_ratio, east_asian_leading,
+    first_drawn_baseline, grid_baseline_offset, grid_snapped_line_h, inline_line_advance,
+    inserted_picture_descent, is_text_empty, line_h_with_picture, line_max_image_h,
+    line_own_advance, lines_height, mark_metrics, picture_grid_cells, picture_line_bottom,
+    position_stretch, rule_on_grid, run_line_metrics, runs_max_image_h, size_grid_lines,
+    size_lines_by_own_runs, tallest_glyph_run_metrics, tallest_run_metrics, top_aligned_drop,
+};
+pub(super) use super::link_tagger::{LinkAnnotation, LinkTagger};
+
+/// Placeholders for a paragraph without inline pictures.
+pub(super) static EMPTY_INLINE_IMAGES: LazyLock<HashMap<usize, String>> =
+    LazyLock::new(HashMap::new);
+pub(super) static EMPTY_EFFECTS: LazyLock<HashMap<usize, EffectXObjs>> =
+    LazyLock::new(HashMap::new);
+
+/// Run index → registered value (XObject name, effects) for each run holding
+/// an inline picture that `names` knows.
+pub(super) fn run_image_map<V: Clone>(
+    runs: &[Run],
+    names: &HashMap<usize, V>,
+) -> HashMap<usize, V> {
+    runs.iter()
+        .enumerate()
+        .filter_map(|(ri, run)| Some((ri, names.get(&run.inline_image.as_ref()?.id)?.clone())))
+        .collect()
+}
+
+/// How many gaps a stretched line's slack spreads across when the slack goes
+/// between *characters* (applied as PDF `Tc`) rather than between word gaps.
+/// `None` means the line falls back to word-gap justification.
+///
+/// Two callers want char-level spreading: CJK (Word treats inter-character gaps
+/// like word gaps) and `w:jc="distribute"` ("Distribute All Characters Equally",
+/// §17.18.44). They differ at the right edge — CJK justify keeps the trailing
+/// cell gap of the grid, so its slack divides by the character count, while
+/// `distribute` ends flush at both margins (Japanese 均等割り付け behaves the
+/// same way), so it divides by one gap fewer.
+///
+/// ponytail: the count excludes inter-word spaces, so a distributed Latin line
+/// with spaces spreads across one gap too few — case77 sample 3 sits up to 34pt
+/// off Word's interior letter positions, though both margins still land flush.
+/// Word counts spaces as distributable characters. Fixing it means carrying a
+/// per-chunk space count out of the line-breaking loop (`pending_space_w` keeps
+/// only the width, across 5 push sites and ~8 reset points), which is a poor
+/// trade while no corpus fixture distributes text containing spaces.
+pub(super) fn char_justify_gaps(
+    alignment: Alignment,
+    can_justify: bool,
+    has_cjk: bool,
+    char_count: usize,
+) -> Option<usize> {
+    if !can_justify || char_count < 2 {
+        return None;
+    }
+    match (alignment, has_cjk) {
+        (Alignment::Distribute, _) => Some(char_count - 1),
+        (_, true) => Some(char_count),
+        _ => None,
+    }
+}
+
+/// Word's justification of a line mixing Latin and East Asian text: the slack
+/// spreads over every space and the gap after every East Asian character
+/// alike, each space getting a fixed 1/9 em on top, and Latin letters never
+/// spread (Word online probes 2026-10-28, issue #142: a 10pt line with 6
+/// spaces and 17 CJK gaps widens the spaces by 5.17pt and the gaps by
+/// 4.04pt; 12pt lines of 2–11 spaces and 2–24 gaps fit the same model within
+/// Word's quarter-point rounding). The gap before an East Asian character
+/// counts only after a Latin letter, and the line's last character has none.
+pub(super) struct MixedJustify {
+    /// Spaces and East Asian gaps before each chunk.
+    spaces_before: Vec<usize>,
+    points_before: Vec<usize>,
+    /// The last chunk holding text: its final character gets no gap.
+    last_text_chunk: usize,
+    extra: f32,
+    space_bonus: f32,
+}
+
+impl MixedJustify {
+    pub(super) fn new(chunks: &[WordChunk], spaces_before: &[usize], slack: f32) -> Self {
+        let last_text_chunk = chunks
+            .iter()
+            .rposition(|c| c.text.chars().any(|ch| !is_break_space(ch)))
+            .unwrap_or(0);
+        let mut points_before = Vec::with_capacity(chunks.len());
+        let mut points = 0usize;
+        for (i, c) in chunks.iter().enumerate() {
+            points_before.push(points);
+            points += cjk_gap_points(&c.text, i == last_text_chunk)
+                .iter()
+                .filter(|p| **p)
+                .count();
+        }
+        points_before.push(points);
+        let spaces = spaces_before.last().copied().unwrap_or(0) as f32;
+        let total = spaces + points as f32;
+        let bonus = chunks.first().map_or(0.0, |c| c.font_size / 9.0);
+        let (extra, space_bonus) = if total == 0.0 {
+            (0.0, 0.0)
+        } else if slack >= spaces * bonus {
+            ((slack - spaces * bonus) / total, bonus)
+        } else {
+            (0.0, slack / spaces.max(1.0))
+        };
+        Self {
+            spaces_before: spaces_before.to_vec(),
+            points_before,
+            last_text_chunk,
+            extra,
+            space_bonus,
+        }
+    }
+
+    /// How far chunk `idx` moves right; past the last, the line's end.
+    pub(super) fn offset_before(&self, idx: usize) -> f32 {
+        let at = |v: &[usize]| v.get(idx).or(v.last()).copied().unwrap_or(0) as f32;
+        at(&self.spaces_before) * (self.extra + self.space_bonus)
+            + at(&self.points_before) * self.extra
+    }
+
+    /// Extra advance after each character of chunk `idx`, if any widens.
+    pub(super) fn char_extras(&self, idx: usize, text: &str) -> Option<Vec<f32>> {
+        let points = cjk_gap_points(text, idx == self.last_text_chunk);
+        points.iter().any(|p| *p).then(|| {
+            points
+                .into_iter()
+                .map(|p| if p { self.extra } else { 0.0 })
+                .collect()
+        })
+    }
+}
+
+/// Per character of `text`, whether the gap after it is a justification
+/// point (see `MixedJustify`); `last` marks the line's last text chunk.
+fn cjk_gap_points(text: &str, last: bool) -> Vec<bool> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    (0..n)
+        .map(|i| {
+            let c = chars[i];
+            if is_break_space(c) {
+                false
+            } else if crate::docx::is_east_asian_char(c) {
+                !(last && i + 1 == n)
+            } else {
+                chars
+                    .get(i + 1)
+                    .is_some_and(|next| crate::docx::is_east_asian_char(*next))
+            }
+        })
+        .collect()
+}
+
+/// Resolve aligned segment start position given a tab stop, segment runs, and minimum x.
+fn resolve_tab_aligned_start(
+    stop: &TabStop,
+    tab_target: f32,
+    seg_runs: &[&Run],
+    seen_fonts: &HashMap<String, FontEntry>,
+    min_x: f32,
+) -> f32 {
+    // The segment's leading spaces sit before the aligned text, not inside
+    // it (Word probes on a right tab: 0 or 4 leading spaces end the text at
+    // the stop alike; 24 push it right by what no longer fits before it).
+    let lead = || leading_space_width(seg_runs, seen_fonts);
+    match stop.alignment {
+        TabAlignment::Left => tab_target.max(min_x),
+        TabAlignment::Center => {
+            let sw = segment_width(seg_runs, seen_fonts);
+            (tab_target - sw / 2.0 - lead()).max(min_x)
+        }
+        TabAlignment::Right => {
+            let sw = segment_width(seg_runs, seen_fonts);
+            (tab_target - sw - lead()).max(min_x)
+        }
+        TabAlignment::Decimal => {
+            let bw = decimal_before_width(seg_runs, seen_fonts);
+            (tab_target - bw).max(min_x)
+        }
+    }
+}
+
+/// U+00A0 (non-breaking space) renders as a space but must not allow line breaks.
+pub(super) fn is_break_space(c: char) -> bool {
+    c.is_whitespace() && c != '\u{00a0}' && c != '\u{3000}'
+}
+
+/// Word wraps a URL only after a hyphen, or at the margin once it is wider
+/// than the line: over 102 URL line ends in Word PDFs, 2 fall after a `/`.
+/// UAX #14 also allows breaks after `/`, `?` and the like, so those go.
+fn drop_url_breaks(text: &str, breaks: &mut Vec<usize>) {
+    let mut urls = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = [text[from..].find("://"), text[from..].find("www.")]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        let at = from + rel;
+        let start = text[..at]
+            .rfind(|c: char| !c.is_ascii_alphanumeric())
+            .map_or(0, |i| i + 1);
+        let end = text[at..]
+            .find(char::is_whitespace)
+            .map_or(text.len(), |i| at + i);
+        urls.push(start..end);
+        from = end;
+    }
+    breaks.retain(|&b| !urls.iter().any(|u| u.start < b && b < u.end) || text[..b].ends_with('-'));
+}
+
+/// Word's departures from UAX #14 that depend only on the two adjacent
+/// characters: `Some(true)` adds a break, `Some(false)` removes one, `None`
+/// keeps UAX #14's answer. The URL rule needs more context (`drop_url_breaks`).
+fn word_pair_rule(a: char, b: char) -> Option<bool> {
+    // A period immediately followed by an opening parenthesis remains joined.
+    if a == '.' && b == '(' {
+        return Some(false);
+    }
+    // Word keeps an abbreviation joined to an adjacent numero sign.
+    if a == '.' && b == '№' {
+        return Some(false);
+    }
+    // LB30 keeps a letter or digit on an opening bracket only when the bracket
+    // is not full-width: Word breaks "57（3）", "ab（", "57【" and "57「" before
+    // the bracket and keeps "57(" (issue #163 probes).
+    if a.is_alphanumeric()
+        && !crate::docx::is_east_asian_char(a)
+        && matches!(
+            b,
+            '（' | '［'
+                | '｛'
+                | '｟'
+                | '「'
+                | '『'
+                | '【'
+                | '〔'
+                | '〈'
+                | '《'
+                | '〖'
+                | '〘'
+                | '〚'
+        )
+    {
+        return Some(true);
+    }
+    // Word breaks after a hyphen-minus where UAX #14 does not: before another
+    // hyphen (LB21 would make a dash run one unbreakable word; family_kinship's
+    // 87-dash rules wrap into two columns of dashes) and before a digit (LB25
+    // keeps "2019-2024" whole; 13 reference line ends such as "Sindh 2019-",
+    // "1(4): 108-", "about 3-"). Opening guillemets also permit a break:
+    // Word wraps `Office «North Ural»-«Branch»` after the hyphen.
+    if a == '-' && (b == '-' || b.is_ascii_digit() || b == '«') {
+        return Some(true);
+    }
+    // Word breaks after any breaking space, also before what LB13 glues to it
+    // (`.`, `,`, `/`, `)`, `!`): czech_wastewater_discharge_permit wraps
+    // "Telefon" + 3 spaces + a dot leader, czech_works_contract before
+    // ",,zákon“", stem_partnerships before "/ events".
+    if is_break_space(a) && !is_break_space(b) {
+        return Some(true);
+    }
+    // UAX #14 breaks after a solidus, Word doesn't: croatian_grant keeps
+    // "troškova/izdataka" whole and wraps before it.
+    if a == '/' && b.is_alphanumeric() {
+        return Some(false);
+    }
+    // Class IN allows a break after an ellipsis before digits, but Word keeps
+    // tokens like TOC dot-leaders typed as "…………45" unbreakable.
+    if matches!(a, '\u{2024}' | '\u{2025}' | '\u{2026}') && !b.is_whitespace() {
+        return Some(false);
+    }
+    None
+}
+
+/// `word_pair_rule` for the characters either side of byte offset `i`.
+fn word_pair_rule_at(text: &str, i: usize) -> Option<bool> {
+    word_pair_rule(text[..i].chars().next_back()?, text[i..].chars().next()?)
+}
+
+/// True when `split_preserving_spaces` would break between `a` and `b` inside one
+/// run: UAX #14 plus Word's pair rules. Run boundaries call this for every
+/// glued word, so it stays off the heap.
+pub(super) fn breaks_between(a: char, b: char) -> bool {
+    if let Some(rule) = word_pair_rule(a, b) {
+        return rule;
+    }
+    let mut buf = [0u8; 8];
+    let la = a.encode_utf8(&mut buf).len();
+    let lb = b.encode_utf8(&mut buf[la..]).len();
+    let Ok(pair) = std::str::from_utf8(&buf[..la + lb]) else {
+        return false;
+    };
+    unicode_linebreak::linebreaks(pair).any(|(pos, _)| pos == la)
+}
+
+/// Split text into (preceding_space_count, word) segments using UAX #14 line break rules.
+/// Handles CJK character boundaries, hyphens, and punctuation break opportunities
+/// in addition to whitespace. Non-breaking spaces (U+00A0) and ideographic spaces
+/// (U+3000) are kept within words. Trailing spaces after the last word are handled
+/// separately by the caller.
+pub(super) fn split_preserving_spaces(text: &str) -> Vec<(usize, &str)> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+    let mut pending_spaces: usize = 0;
+
+    // Collect UAX #14 break positions (byte offsets where breaks are allowed/mandatory)
+    let mut breaks: Vec<usize> = unicode_linebreak::linebreaks(text)
+        .map(|(pos, _)| pos)
+        .collect();
+    drop_url_breaks(text, &mut breaks);
+    breaks.retain(|&b| word_pair_rule_at(text, b) != Some(false));
+    breaks.extend(
+        text.char_indices()
+            .map(|(i, _)| i)
+            .filter(|&i| word_pair_rule_at(text, i) == Some(true)),
+    );
+    breaks.sort_unstable();
+
+    let mut prev = 0;
+    for &brk in &breaks {
+        let segment = &text[prev..brk];
+        prev = brk;
+
+        if segment.is_empty() {
+            continue;
+        }
+
+        // Count leading break-spaces in this segment
+        let leading_bytes: usize = segment
+            .chars()
+            .take_while(|c| is_break_space(*c))
+            .map(|c| c.len_utf8())
+            .sum();
+        let leading_count = segment[..leading_bytes].chars().count();
+
+        // Count trailing break-spaces
+        let trailing_bytes: usize = segment
+            .chars()
+            .rev()
+            .take_while(|c| is_break_space(*c))
+            .map(|c| c.len_utf8())
+            .sum();
+        let trailing_count = if trailing_bytes < segment.len() - leading_bytes {
+            segment[segment.len() - trailing_bytes..].chars().count()
+        } else {
+            0
+        };
+
+        pending_spaces += leading_count;
+
+        let word_start = leading_bytes;
+        let word_end = segment.len() - trailing_bytes;
+
+        if word_start < word_end {
+            result.push((pending_spaces, &segment[word_start..word_end]));
+            pending_spaces = trailing_count;
+        } else {
+            // Segment is all spaces
+            pending_spaces += trailing_count;
+        }
+    }
+
+    result
+}
+
+#[derive(Clone)]
+pub(super) struct WordChunk {
+    pub(super) pdf_font: String,
+    pub(super) text: String,
+    pub(super) font_size: f32,
+    /// The run's own size before small caps or super/subscript shrink it; a
+    /// line is as tall as its runs at this size (`size_lines_by_own_runs`).
+    pub(super) line_font_size: f32,
+    pub(super) color: Option<[u8; 3]>,
+    pub(super) highlight: Option<[u8; 3]>,
+    pub(super) shading: Option<[u8; 3]>,
+    pub(super) border: Option<ParagraphBorder>,
+    pub(super) x_offset: f32, // x relative to line start
+    pub(super) width: f32,
+    pub(super) underline: bool,
+    pub(super) underline_style: crate::model::UnderlineStyle,
+    /// `w:u w:color`; `None` draws the underline in `color`.
+    pub(super) underline_color: Option<[u8; 3]>,
+    pub(super) strikethrough: bool,
+    pub(super) dstrike: bool,
+    /// A tracked change (markup view): its line gets a change bar.
+    pub(super) revised: bool,
+    pub(super) char_spacing: f32,
+    pub(super) text_scale: f32, // percentage, 100.0 = normal
+    pub(super) y_offset: f32,   // superscript/subscript, or inline picture's bottom extent
+    /// `w:position` share of `y_offset`: it stretches the line box, unlike
+    /// super/subscript (see `size_lines_by_own_runs`).
+    pub(super) raise: f32,
+    pub(super) hyperlink_url: Option<String>,
+    pub(super) inline_image_name: Option<String>,
+    pub(super) inline_image_height: f32,
+    /// Running-head wrapped pictures can reserve their effect/wrap extent
+    /// separately from the rotated visible image box.
+    pub(super) inline_image_extra_height: f32,
+    pub(super) inline_image_stroke_color: Option<[u8; 3]>,
+    pub(super) inline_image_stroke_width: f32,
+    pub(super) inline_image_shadow: Option<crate::model::ImageShadow>,
+    pub(super) inline_image_glow: Option<crate::model::ImageGlow>,
+    pub(super) inline_image_effect_xobjs: Option<super::images::EffectXObjs>,
+    pub(super) inline_image_clip: Option<crate::model::ShapeGeometry>,
+    /// Natural (unrotated) size; `width`/`inline_image_height` hold the rotated box.
+    pub(super) inline_image_size: (f32, f32),
+    pub(super) inline_image_trim: f32,
+    pub(super) inline_image_effect_left: f32,
+    /// Clockwise degrees (OOXML).
+    pub(super) inline_image_rotation_deg: f32,
+    /// The picture's `docPr@descr` and adec:decorative flag, for tagging.
+    pub(super) inline_image_alt: Option<String>,
+    pub(super) inline_image_decorative: bool,
+    pub(super) synthetic_bold: bool,
+    pub(super) synthetic_italic: bool,
+    pub(super) text_outline: Option<TextOutline>,
+    pub(super) text_fill: Option<TextFill>,
+    /// Legacy w:shadow/emboss/imprint drop-shadow: drawn as an offset gray copy
+    /// of the glyphs behind the main text.
+    pub(super) text_shadow: Option<TextShadow>,
+    pub(super) comment_ids: Vec<u32>,
+    /// Footnote this chunk is the reference mark of. Word puts a footnote on
+    /// the page where its reference mark lands, so pagination needs to know
+    /// which line carries which reference.
+    pub(super) footnote_id: Option<u32>,
+    /// Endnote this chunk is the reference mark of (tagging only).
+    pub(super) endnote_id: Option<u32>,
+    /// The source letters when caps/small caps draw different ones, given to
+    /// text extraction and screen readers as `/ActualText`.
+    pub(super) actual_text: Option<String>,
+    /// The language of this text (`w:lang`), for a `/Lang` Span when it isn't
+    /// the document's.
+    pub(super) lang: Option<Arc<str>>,
+    /// Points already trimmed from a trailing full-width punctuation mark by
+    /// `compress_punctuation`; caps further squeezing at half an em.
+    pub(super) punct_compressed: f32,
+    /// A break-space followed this word in the source. Words are positioned
+    /// individually, so the space is drawn as an invisible glyph after the word
+    /// purely so text extraction and screen readers see the word boundary.
+    pub(super) space_after: bool,
+    /// Literal break spaces before this chunk (more than one when typed so).
+    pub(super) preceding_spaces: usize,
+    /// Characters of `text` that begin a source run (`Run::source_breaks`);
+    /// 0 also when the run began in the spaces before the word.
+    pub(super) source_starts: Vec<usize>,
+    /// Ordinary word-space decoration; excludes tab-stop decorations.
+    pub(super) word_space_bridge: bool,
+    /// A tab's leader filling the gap `x_offset..x_offset + width`; drawn
+    /// on the page's leader grid (`glyph_grid::leader_positions`).
+    pub(super) leader: Option<char>,
+    /// The math zone's spoken form, for its Formula (see `Run::formula`).
+    pub(super) formula: Option<Arc<str>>,
+    /// Pair kerning is on for this run at this size (`w:kern`); `width` already
+    /// includes it, so the glyphs are drawn kerned too.
+    pub(super) kern: bool,
+    /// Drawn as a square in place of the text (`Run::checkbox`).
+    pub(super) checkbox: Option<FormCheckbox>,
+    /// Guide text drawn above this chunk and the ones sharing it.
+    pub(super) ruby: Option<std::sync::Arc<crate::model::Ruby>>,
+    /// From a `w:rtl` run (bidi embedding, mirrored brackets).
+    pub(super) rtl: bool,
+    /// From a `w:hint="eastAsia"` run: its curly quotes are full-width
+    /// punctuation (see `is_hint_ambiguous`).
+    pub(super) east_asia_hint: bool,
+    /// At a right-to-left level: glyphs are placed from the right
+    /// (`show_rtl`), in logical order.
+    pub(super) rtl_glyphs: bool,
+    /// The space before this chunk came from a `w:rtl` run: bidi ordering
+    /// gives it that run's embedding.
+    pub(super) gap_rtl: bool,
+    /// An Office Math zone drawn from its box; `text` is its linear form.
+    pub(super) math: Option<Arc<crate::math::MathBox>>,
+}
+
+/// A run's Office Math box and the math font it draws with, once laid out
+/// (`fonts::register_math_font`); None leaves the zone's linear text.
+pub(super) fn math_box<'f>(
+    run: &'f Run,
+    fonts: &'f HashMap<String, FontEntry>,
+) -> Option<(&'f FontEntry, &'f Arc<crate::math::MathBox>)> {
+    let entry = fonts.get(super::fonts::MATH_FONT_KEY)?;
+    let mb = entry
+        .math_boxes
+        .get(&Arc::as_ptr(run.math.as_ref()?).addr())?;
+    Some((entry, mb))
+}
+
+/// Pale-pink highlight color Word uses for comment-anchored text spans.
+pub(super) const COMMENT_HIGHLIGHT_RGB: [u8; 3] = [251, 220, 217];
+
+impl WordChunk {
+    /// Take `cut` off the closing mark this chunk ends in (compressPunctuation).
+    pub(super) fn squeeze_mark(&mut self, cut: f32) {
+        self.width -= cut;
+        self.punct_compressed += cut;
+    }
+
+    /// The note this chunk is the reference mark of: (endnote, id).
+    pub(super) fn note(&self) -> Option<(bool, u32)> {
+        self.footnote_id
+            .map(|id| (false, id))
+            .or(self.endnote_id.map(|id| (true, id)))
+    }
+
+    /// A space glyph goes after the word, marking the word boundary for text
+    /// extraction (a font without one leaves it out).
+    pub(super) fn boundary_space(&self, entry: Option<&FontEntry>) -> bool {
+        self.space_after && entry.is_none_or(|e| e.has_char(' '))
+    }
+
+    /// Every field at its default; the constructors override what they set.
+    pub(super) fn blank(pdf_font: String, font_size: f32, x_offset: f32, width: f32) -> Self {
+        Self {
+            pdf_font,
+            text: String::new(),
+            font_size,
+            line_font_size: font_size,
+            color: None,
+            highlight: None,
+            shading: None,
+            border: None,
+            x_offset,
+            width,
+            underline: false,
+            underline_style: crate::model::UnderlineStyle::Single,
+            underline_color: None,
+            strikethrough: false,
+            dstrike: false,
+            revised: false,
+            char_spacing: 0.0,
+            text_scale: 100.0,
+            y_offset: 0.0,
+            raise: 0.0,
+            hyperlink_url: None,
+            inline_image_name: None,
+            inline_image_height: 0.0,
+            inline_image_extra_height: 0.0,
+            inline_image_stroke_color: None,
+            inline_image_stroke_width: 0.0,
+            inline_image_shadow: None,
+            inline_image_glow: None,
+            inline_image_effect_xobjs: None,
+            inline_image_clip: None,
+            inline_image_size: (0.0, 0.0),
+            inline_image_trim: 0.0,
+            inline_image_effect_left: 0.0,
+            inline_image_rotation_deg: 0.0,
+            inline_image_alt: None,
+            inline_image_decorative: false,
+            synthetic_bold: false,
+            synthetic_italic: false,
+            text_outline: None,
+            text_fill: None,
+            text_shadow: None,
+            comment_ids: Vec::new(),
+            footnote_id: None,
+            endnote_id: None,
+            actual_text: None,
+            lang: None,
+            punct_compressed: 0.0,
+            space_after: false,
+            preceding_spaces: 1,
+            source_starts: Vec::new(),
+            word_space_bridge: false,
+            leader: None,
+            formula: None,
+            kern: false,
+            checkbox: None,
+            ruby: None,
+            rtl: false,
+            east_asia_hint: false,
+            rtl_glyphs: false,
+            gap_rtl: false,
+            math: None,
+        }
+    }
+
+    fn text(
+        entry: &FontEntry,
+        run: &Run,
+        word: &str,
+        eff_fs: f32,
+        char_spacing: f32,
+        y_offset: f32,
+        x_offset: f32,
+        width: f32,
+    ) -> Self {
+        Self {
+            source_starts: source_starts(run, word),
+            text: word.to_string(),
+            line_font_size: run.font_size,
+            color: run.color,
+            highlight: run.highlight,
+            shading: if run.shading.is_none() && !run.comment_ids.is_empty() {
+                Some(COMMENT_HIGHLIGHT_RGB)
+            } else {
+                run.shading
+            },
+            border: run.border.clone(),
+            underline: run.underline,
+            underline_style: run.underline_style,
+            underline_color: run.underline_color,
+            strikethrough: run.strikethrough,
+            dstrike: run.dstrike,
+            revised: run.revised,
+            char_spacing,
+            text_scale: run.text_scale,
+            y_offset,
+            raise: run.position,
+            hyperlink_url: run.hyperlink_url.clone(),
+            synthetic_bold: entry.synthetic_bold,
+            synthetic_italic: entry.synthetic_italic,
+            text_outline: run.text_outline.clone(),
+            text_fill: run.text_fill.clone(),
+            text_shadow: run.text_shadow.clone(),
+            comment_ids: [&run.comment_ids[..], &run.comment_anchor_ids[..]].concat(),
+            footnote_id: run.footnote_id,
+            endnote_id: run.endnote_id,
+            lang: chunk_lang(run, word),
+            formula: run.formula.clone(),
+            kern: run.kerns_at(eff_fs),
+            checkbox: run.checkbox,
+            ruby: run.ruby.clone(),
+            rtl: run.rtl,
+            east_asia_hint: run.east_asia_hint,
+            ..Self::blank(entry.pdf_name.clone(), eff_fs, x_offset, width)
+        }
+    }
+
+    /// A laid-out Office Math zone at `x_offset`, drawn in the math font.
+    fn math(entry: &FontEntry, run: &Run, mb: &Arc<crate::math::MathBox>, x_offset: f32) -> Self {
+        let mut chunk = Self::text(
+            entry,
+            run,
+            &run.text,
+            run.font_size,
+            0.0,
+            0.0,
+            x_offset,
+            mb.width,
+        );
+        chunk.math = Some(mb.clone());
+        chunk
+    }
+
+    fn image(
+        pdf_name: &str,
+        run: &Run,
+        x_offset: f32,
+        img: &crate::model::EmbeddedImage,
+        effect_xobjs: Option<super::images::EffectXObjs>,
+        // The run's registered font: its metrics place a revised picture's
+        // strike and underline.
+        pdf_font: String,
+    ) -> Self {
+        let (width, height) = img.layout_size();
+        Self {
+            color: run.color,
+            // Markup view: a deleted picture is struck at the text's strike
+            // height across its width (plus a 1.44pt line through its middle,
+            // drawn with the picture), an inserted one underlined (Word for
+            // Mac probe p10).
+            underline: run.underline,
+            strikethrough: run.strikethrough,
+            revised: run.revised,
+            inline_image_name: Some(pdf_name.to_string()),
+            inline_image_height: height,
+            inline_image_stroke_color: img.stroke_color,
+            inline_image_stroke_width: img.stroke_width,
+            inline_image_shadow: img.shadow.clone(),
+            inline_image_glow: img.glow.clone(),
+            inline_image_effect_xobjs: effect_xobjs,
+            inline_image_clip: img.clip_geometry.clone(),
+            inline_image_size: (img.display_width, img.display_height),
+            inline_image_trim: img.trimmed_width,
+            inline_image_effect_left: img.effect_left,
+            inline_image_rotation_deg: img.rotation_deg,
+            inline_image_alt: img.alt.clone(),
+            inline_image_decorative: img.decorative,
+            ..Self::blank(pdf_font, run.font_size, x_offset, width)
+        }
+    }
+
+    fn leader(
+        entry: &FontEntry,
+        ch: char,
+        count: usize,
+        font_size: f32,
+        color: Option<[u8; 3]>,
+        x_offset: f32,
+        width: f32,
+    ) -> Self {
+        Self {
+            text: std::iter::repeat_n(ch, count).collect(),
+            color,
+            synthetic_bold: entry.synthetic_bold,
+            synthetic_italic: entry.synthetic_italic,
+            leader: Some(ch),
+            ..Self::blank(entry.pdf_name.clone(), font_size, x_offset, width)
+        }
+    }
+
+    /// A struck run that is not underlined (a deletion in the markup view):
+    /// its single or double strike bridges its spaces instead of an underline.
+    fn struck_like(mut self, run: &Run) -> Self {
+        if !run.underline {
+            self.underline = false;
+            self.strikethrough = run.strikethrough;
+            self.dstrike = run.dstrike;
+        }
+        self
+    }
+
+    fn word_space_underline(
+        entry: &FontEntry,
+        font_size: f32,
+        color: Option<[u8; 3]>,
+        underline_style: crate::model::UnderlineStyle,
+        border: Option<ParagraphBorder>,
+        x_offset: f32,
+        width: f32,
+    ) -> Self {
+        let mut chunk = Self::tab_underline(
+            entry,
+            font_size,
+            color,
+            underline_style,
+            border,
+            x_offset,
+            width,
+        );
+        chunk.word_space_bridge = true;
+        chunk
+    }
+
+    /// Decoration-only chunk: no glyphs, but the underline decoration pass
+    /// draws a line spanning the chunk's width. Used for underlined tab gaps.
+    fn tab_underline(
+        entry: &FontEntry,
+        font_size: f32,
+        color: Option<[u8; 3]>,
+        underline_style: crate::model::UnderlineStyle,
+        border: Option<ParagraphBorder>,
+        x_offset: f32,
+        width: f32,
+    ) -> Self {
+        Self {
+            color,
+            // Carry the run's border so a bridged space keeps the border span
+            // contiguous (otherwise a None-border space chunk splits the box).
+            border,
+            underline: true,
+            underline_style,
+            ..Self::blank(entry.pdf_name.clone(), font_size, x_offset, width)
+        }
+    }
+}
+
+/// When a line spans two text regions (bothSides wrapping around a float),
+/// this stores where the right region begins and its geometry.
+pub(super) struct RightRegion {
+    pub(super) first_chunk_idx: usize,
+    pub(super) region_x: f32,
+    pub(super) region_width: f32,
+    pub(super) content_width: f32,
+}
+
+#[derive(Default)]
+pub(super) struct TextLine {
+    pub(super) chunks: Vec<WordChunk>,
+    pub(super) total_width: f32,
+    pub(super) ends_with_break: bool,
+    pub(super) right_region: Option<RightRegion>,
+    /// Font size of the line break run that created this empty line.
+    /// Used to compute the correct line height for break-created lines
+    /// (Word uses the break run's font metrics, not the paragraph's).
+    pub(super) break_font_size: Option<f32>,
+    /// Line-height ratio of the break run that ended this otherwise empty line.
+    pub(super) break_lhr: Option<f32>,
+    /// An empty line made by leading spaces wrapping an inline picture.
+    pub(super) leading_space_wrap: bool,
+    /// An empty line retained by a wrapping tab; its consumed tabs size the line.
+    pub(super) leading_tab_wrap: bool,
+    /// First chunk after the line's last tab: justification stretches only the
+    /// gaps from here on (Word starts the text at the tab stop).
+    pub(super) justify_from: usize,
+    /// The breaker kept this line's last word by narrowing its spaces
+    /// (`SPACE_SQUEEZE`), so it is wider than the measure until justified.
+    pub(super) squeezed: bool,
+    /// The squeeze narrows every character, not just the spaces
+    /// (`CjkLayout::squeeze_line`).
+    pub(super) squeeze_chars: bool,
+    /// Left at natural width although justified (`doNotExpandShiftReturn`).
+    pub(super) natural_width: bool,
+    /// An empty line beside a float that could not hold the next word: Word
+    /// moves on to the next line (and takes the first-line indent there).
+    pub(super) float_skip: bool,
+    /// This line's own advance when its tallest face differs from the
+    /// paragraph's (see `size_lines_by_own_runs`); None uses the paragraph pitch.
+    pub(super) pitch: Option<f32>,
+    /// Chunk indices in logical order when bidi reordering stored the chunks
+    /// visually (`bidi::reorder_lines`); empty: the stored order.
+    pub(super) draw_order: Vec<usize>,
+    /// Width of the space the line wrapped at (dropped from the line); bidi
+    /// ordering places it (`bidi::reorder_lines`).
+    pub(super) trailing_space: f32,
+    /// That space came from a `w:rtl` run.
+    pub(super) trailing_space_rtl: bool,
+    /// In a `w:bidi` paragraph: the first-line indent is on the right and a
+    /// justified paragraph's last line ends at the right.
+    pub(super) rtl_paragraph: bool,
+    /// Kerned text on this line is drawn through Word's OpenType shaping
+    /// path, which rounds device advances differently (`glyph_grid`).
+    pub(super) shaped_kerning: bool,
+    /// How far this line's baseline sits below where the paragraph ascent
+    /// would put it (negative: above), for lines with their own `pitch`.
+    pub(super) ascent_shift: f32,
+    /// Room skipped below this line: the next one starts below a float it
+    /// would reach into.
+    pub(super) gap_after: f32,
+    /// The underlined spaces the line ends in (`underline_line_end`).
+    pub(super) end_spaces: Vec<EndSpace>,
+    /// The glyph box of a line with its own `pitch` under a multiple above
+    /// single: its runs' highest ascent to their deepest descent, without the
+    /// leading.
+    pub(super) text_box: Option<f32>,
+    /// A line laid out around its `w:textAlignment` line (a picture line, or
+    /// one on a line grid): how far below the line top that line sits, as
+    /// if the first baseline were `ascent` down. Chunks are drawn relative to
+    /// it and `pitch` holds the line's advance (`align_line`).
+    pub(super) ref_line: Option<f32>,
+}
+
+/// A run's share of the spaces a line ends in, drawn as its underline only
+/// up to the line's right edge.
+pub(super) struct EndSpace {
+    pub(super) x_offset: f32,
+    pub(super) width: f32,
+    pub(super) pdf_font: String,
+    pub(super) font_size: f32,
+    pub(super) color: Option<[u8; 3]>,
+    pub(super) style: crate::model::UnderlineStyle,
+}
+
+impl TextLine {
+    /// The width of the content before any right region (for alignment and
+    /// justification).
+    pub(super) fn left_content_width(&self) -> f32 {
+        match &self.right_region {
+            Some(rr) => self.chunks[..rr.first_chunk_idx]
+                .last()
+                .map_or(0.0, |c| c.x_offset + c.width),
+            None => self.total_width,
+        }
+    }
+
+    pub(super) fn is_blank(&self) -> bool {
+        self.chunks.is_empty() && self.end_spaces.is_empty()
+    }
+
+    /// Leading tabs occupy a line even without printable chunks; the tabs
+    /// consumed on it size the otherwise blank line.
+    pub(super) fn hold_tabs(&mut self, tabs: Option<(f32, Option<f32>)>) {
+        if self.chunks.is_empty()
+            && let Some((font_size, lhr)) = tabs
+        {
+            self.break_font_size = Some(font_size);
+            self.break_lhr = lhr;
+            self.leading_tab_wrap = true;
+        }
+    }
+}
+
+/// Word sizes a superscript or subscript by the face's OS/2 script size,
+/// rounded to the nearest half point: Aptos (0.600) 12pt → 7.0, Palatino
+/// (0.601) 10pt → 6.0, Times/Arial/Calibri (0.650) 12pt → 8.0, 11pt → 7.0,
+/// 9.5pt → 6.0 (census over 30 fixtures' references).
+pub(super) fn effective_font_size(run: &Run, entry: &FontEntry) -> f32 {
+    let ratio = match run.vertical_align {
+        VertAlign::Superscript => entry.superscript_ratio,
+        VertAlign::Subscript => entry.subscript_ratio,
+        VertAlign::Baseline => return run.font_size,
+    };
+    // ponytail: 0.65 is the common OS/2 value, for faces without one (Type1 fallback).
+    round_half_point(run.font_size * ratio.unwrap_or(0.65))
+    // Note: smallCaps sizing is handled per-segment via smallcaps_segments()
+}
+
+/// The width of text on one line: a soft hyphen there shows nothing, and
+/// Word kerns no pair across it ("A", soft hyphen, "V" is as wide as "A"
+/// and "V" apart).
+pub(super) fn soft_split_width(text: &str, width: impl Fn(&str) -> f32) -> f32 {
+    text.split(SOFT_HYPHEN).map(width).sum()
+}
+
+/// A word as `w:caps` draws it (capitals); words are uppercased one by one so
+/// the word as written stays at hand for `/ActualText`.
+pub(super) fn caps_word<'a>(run: &Run, word: &'a str) -> Cow<'a, str> {
+    if run.caps {
+        Cow::Owned(word.to_uppercase())
+    } else {
+        Cow::Borrowed(word)
+    }
+}
+
+/// `caps_word` for a paragraph line (`soft_shown`).
+fn shown_word<'a>(run: &Run, word: &'a str) -> Cow<'a, str> {
+    let soft = soft_shown(word);
+    if run.caps {
+        Cow::Owned(soft.to_uppercase())
+    } else {
+        soft
+    }
+}
+
+/// A `w:softHyphen` (U+00AD) ends its word (UAX #14 breaks after it) and
+/// shows as a hyphen there, taken back when the next word joins it on the
+/// line (`drop_soft_hyphen`); inside a word it shows nothing.
+fn soft_shown(word: &str) -> Cow<'_, str> {
+    if !word.contains(SOFT_HYPHEN) {
+        return Cow::Borrowed(word);
+    }
+    let mut out: String = word.chars().filter(|&c| c != SOFT_HYPHEN).collect();
+    if word.ends_with(SOFT_HYPHEN) {
+        out.push('-');
+    }
+    Cow::Owned(out)
+}
+
+const SOFT_HYPHEN: char = '\u{AD}';
+
+/// The advance of the hyphen a soft hyphen ending `source` shows at the end
+/// of `word` (`shown_word`); it may be negative under condensed spacing.
+fn provisional_hyphen(source: &str, word: &str, width: impl Fn(&str) -> f32) -> Option<f32> {
+    source
+        .ends_with(SOFT_HYPHEN)
+        .then(|| width(word) - width(word.strip_suffix('-').unwrap_or(word)))
+}
+
+/// A piece of a word (`split_preserving_spaces`) as Word fits it: its width
+/// with the soft hyphen ending it hidden, and the advance of the hyphen that
+/// soft hyphen shows where the line breaks (negative under condensed
+/// spacing). The pieces of a word add up, as Word kerns no pair across a soft
+/// hyphen.
+fn soft_piece(run: &Run, piece: &str, width: impl Fn(&str) -> f32) -> (f32, Option<f32>) {
+    let body = piece.strip_suffix(SOFT_HYPHEN);
+    let w = width(&shown_word(run, body.unwrap_or(piece)));
+    (w, body.map(|_| width(&shown_word(run, piece)) - w))
+}
+
+/// The pieces (`soft_piece`) a word goes on with through `runs`, the runs
+/// after the one whose text it ends, up to the word's end.
+fn soft_pieces<'r>(
+    runs: impl IntoIterator<Item = &'r Run>,
+    seen_fonts: &HashMap<String, FontEntry>,
+) -> Vec<(f32, Option<f32>)> {
+    let mut pieces = Vec::new();
+    let mut key_buf = String::new();
+    for run in runs.into_iter().filter(|r| !r.vanish) {
+        if run.is_tab
+            || run.is_line_break
+            || run.inline_image.is_some()
+            || run.math.is_some()
+            || run.checkbox.is_some()
+        {
+            break;
+        }
+        let width = run_width(run, seen_fonts, &mut key_buf);
+        let mut after_soft = true;
+        for (spaces, piece) in split_preserving_spaces(&run.text) {
+            if spaces > 0 || !after_soft {
+                return pieces;
+            }
+            pieces.push(soft_piece(run, piece, width));
+            after_soft = piece.ends_with(SOFT_HYPHEN);
+        }
+        if run.text.ends_with(is_break_space) {
+            break;
+        }
+    }
+    pieces
+}
+
+/// A word ending in a soft hyphen whose hyphen overruns the line (`room`),
+/// grown over the pieces the soft hyphens join it to, in the run's text
+/// (`words`, no space between) and on through the later runs' `onward`
+/// pieces (`soft_pieces`), to the longest that fits: Word keeps "Veri" whole
+/// on a line too short for "Ver-", also with "i" in a run of its own. With none
+/// fitting and `whole`, it is the whole word, which Word then cuts at the
+/// margin ("Veri" | "xx", not "Ver" | "ixx"). Grown past the run's text, it
+/// is all of it, without the soft hyphen at its end: the next run goes on
+/// with the word. Returns the word as written, as shown and its width.
+fn soft_continuation<'a>(
+    run: &'a Run,
+    source: &'a str,
+    words: &mut std::collections::VecDeque<(usize, &'a str)>,
+    width: impl Fn(&str) -> f32 + Copy,
+    onward: impl FnOnce() -> Vec<(f32, Option<f32>)>,
+    room: f32,
+    whole: bool,
+) -> (&'a str, Cow<'a, str>, f32) {
+    let text = run.text.as_str();
+    let piece = |s: &str| soft_piece(run, s, width);
+    let source = 'grown: {
+        let start = source.as_ptr() as usize - text.as_ptr() as usize;
+        let mut end = start + source.len();
+        let mut w = piece(source).0;
+        // (end in `text`, width if the line ends there)
+        let mut ends: Vec<(usize, f32)> = Vec::new();
+        for &(spaces, next) in words.iter() {
+            if spaces > 0 || !text[..end].ends_with(SOFT_HYPHEN) {
+                break;
+            }
+            let (pw, hyphen) = piece(next);
+            w += pw;
+            end += next.len();
+            ends.push((end, w + hyphen.unwrap_or(0.0)));
+        }
+        let taken = ends.len();
+        let (mut goes_on, mut onward_fits) = (false, false);
+        if end == text.len() {
+            for (pw, hyphen) in onward() {
+                w += pw;
+                onward_fits |= w + hyphen.unwrap_or(0.0) <= room;
+                goes_on = true;
+            }
+        }
+        if goes_on && !text.ends_with(SOFT_HYPHEN) {
+            ends.pop();
+        }
+        let pick = ends.iter().rposition(|&(_, w)| w <= room);
+        if onward_fits || (pick.is_none() && whole && goes_on) {
+            words.drain(..taken);
+            let rest = &text[start..];
+            break 'grown rest.strip_suffix(SOFT_HYPHEN).unwrap_or(rest);
+        }
+        let pick = pick.or_else(|| ends.len().checked_sub(1).filter(|_| whole));
+        let Some(i) = pick else {
+            break 'grown source;
+        };
+        words.drain(..i + 1);
+        &text[start..ends[i].0]
+    };
+    let shown = shown_word(run, source);
+    let ww = width(&shown);
+    (source, shown, ww)
+}
+
+/// `fitting_prefix_len` for a margin cut in `run`: soft hyphens show nothing
+/// there, and a cut after one moves before it, so the line shows no hyphen.
+fn margin_cut(run: &Run, word: &str, room: f32, width: impl Fn(&str) -> f32) -> Option<usize> {
+    let hidden = |w: &str| width(&caps_word(run, &w.replace(SOFT_HYPHEN, "")));
+    let cut = fitting_prefix_len(word, room, hidden)?;
+    match word[..cut].strip_suffix(SOFT_HYPHEN) {
+        Some(before) if !before.is_empty() => Some(before.len()),
+        _ => Some(cut),
+    }
+}
+
+/// Take back the hyphen a soft hyphen showed at the end of `chunks` (`width`
+/// from `soft_tail`): only a line that breaks there shows it, not one a
+/// manual break or the paragraph's end closes.
+fn drop_soft_hyphen(chunks: &mut Vec<WordChunk>, width: Option<f32>) {
+    if let Some(w) = width
+        && let Some(c) = chunks.last_mut()
+        && c.text.ends_with('-')
+    {
+        c.text.pop();
+        c.width -= w;
+        if let Some(a) = c.actual_text.as_mut().filter(|a| a.ends_with('-')) {
+            a.pop();
+        }
+        if c.text.is_empty() {
+            chunks.pop();
+        }
+    }
+}
+
+fn round_half_point(pt: f32) -> f32 {
+    (pt * 2.0).round() / 2.0
+}
+
+/// Word sets small capitals at 80% of the size, to the nearest half point
+/// (probe 2026-10-05: 8→6.5, 11→9, 12→9.5, 13→10.5, 20→16).
+fn small_caps_size(base_fs: f32) -> f32 {
+    round_half_point(base_fs * 0.8)
+}
+
+/// In small caps a space beside a lowercase letter is small too (probe:
+/// "def X", "X ghi", "12 jk" small; ". 12" full).
+fn small_caps_space(prev: Option<char>, next: Option<char>) -> bool {
+    prev.is_some_and(char::is_lowercase) || next.is_some_and(char::is_lowercase)
+}
+
+/// The width of the word spaces before `word` in `run`, per space; `prev`
+/// carries the run's previous word along for the small-caps rule.
+fn word_space_width(
+    run: &Run,
+    entry: &FontEntry,
+    eff_fs: f32,
+    word: &str,
+    prev: &mut Option<char>,
+) -> f32 {
+    let small = run.small_caps && small_caps_space(*prev, word.chars().next());
+    *prev = word.chars().next_back();
+    let fs = if small {
+        small_caps_size(eff_fs)
+    } else {
+        eff_fs
+    };
+    entry.scaled_word_width(" ", fs, false, run.text_scale) + run.char_spacing
+}
+
+/// Split a word into (text, font_size, source) segments for smallCaps rendering.
+/// Lowercase chars are uppercased and rendered at `small_caps_size`;
+/// uppercase chars and non-letters stay at base_fs. `source` is the
+/// segment's letters as written.
+pub(super) fn smallcaps_segments(word: &str, base_fs: f32) -> Vec<(String, f32, &str)> {
+    let reduced = small_caps_size(base_fs);
+    let mut segments: Vec<(String, f32, &str)> = Vec::new();
+    let mut start = 0;
+    let mut prev = None;
+    let mut chars = word.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        let next = chars.peek().map(|&(_, c)| c);
+        let is_lower = ch.is_lowercase() || (ch == ' ' && small_caps_space(prev, next));
+        prev = Some(ch);
+        let fs = if is_lower { reduced } else { base_fs };
+        let display: String = if is_lower {
+            ch.to_uppercase().collect()
+        } else {
+            ch.to_string()
+        };
+        let end = i + ch.len_utf8();
+        if let Some(last) = segments.last_mut()
+            && (last.1 - fs).abs() < 0.001
+        {
+            last.0.push_str(&display);
+            last.2 = &word[start..end];
+            continue;
+        }
+        start = i;
+        segments.push((display, fs, &word[i..end]));
+    }
+    segments
+}
+
+/// Compute the width of a word, handling smallCaps per-segment sizing.
+/// Byte length of the longest prefix of `word` (at least one character)
+/// that fits in `room`; None when the whole word fits or is one character.
+fn fitting_prefix_len(word: &str, room: f32, width: impl Fn(&str) -> f32) -> Option<usize> {
+    let ends: Vec<usize> = word.char_indices().map(|(i, c)| i + c.len_utf8()).collect();
+    if ends.len() < 2 {
+        return None;
+    }
+    // Widths grow with the prefix, so the last fitting end is a partition point.
+    let fits = ends[..ends.len() - 1].partition_point(|&e| width(&word[..e]) <= room);
+    Some(ends[fits.saturating_sub(1)])
+}
+
+/// The width of the first word of `runs`, up to its first break opportunity
+/// as the line breaker sees it, across run boundaries (a bold "I" before
+/// "nternationalization" is one word, and so is "Hi" + no-break space +
+/// "Internationalization"), None before any word.
+pub(super) fn opening_word_width(runs: &[Run], fonts: &HashMap<String, FontEntry>) -> Option<f32> {
+    let mut width: Option<f32> = None;
+    let mut prev_char = None;
+    let mut spaces_since = 0usize;
+    let mut space_width = 0.0;
+    let mut key_buf = String::new();
+    for run in runs.iter().filter(|r| !r.vanish) {
+        if run.is_tab || run.is_line_break || run.math.is_some() {
+            if width.is_some() {
+                break;
+            }
+            continue;
+        }
+        if let Some(img) = &run.inline_image {
+            if width.is_some() && spaces_since > 0 {
+                break;
+            }
+            return Some(width.unwrap_or(0.0) + img.layout_size().0);
+        }
+        let Some(entry) = fonts.get(font_key_buf(run, &mut key_buf)) else {
+            continue;
+        };
+        let eff_fs = effective_font_size(run, entry);
+        let measure = |s: &str| word_width_for_run(entry, run, s, eff_fs);
+        for (i, (spaces, word)) in split_preserving_spaces(&run.text).into_iter().enumerate() {
+            spaces_since += spaces;
+            space_width += spaces as f32 * measure(" ");
+            let shown = caps_word(run, word);
+            if let Some(w) = width {
+                let joins = if spaces_since > 0 {
+                    prev_char == Some('\u{00a0}') || shown.starts_with('\u{00a0}')
+                } else {
+                    i == 0
+                        && prev_char
+                            .zip(shown.chars().next())
+                            .is_some_and(|(a, b)| !breaks_between(a, b))
+                };
+                if !joins {
+                    return Some(w);
+                }
+                width = Some(w + space_width);
+            }
+            spaces_since = 0;
+            space_width = 0.0;
+            if word.is_empty() {
+                continue;
+            }
+            width = Some(width.unwrap_or(0.0) + measure(&shown));
+            prev_char = shown.chars().last();
+        }
+        let trailing = run
+            .text
+            .chars()
+            .rev()
+            .take_while(|&c| is_break_space(c))
+            .count();
+        if width.is_some() {
+            spaces_since += trailing;
+            space_width += trailing as f32 * measure(" ");
+        }
+    }
+    width
+}
+
+pub(super) fn word_width_for_run(entry: &FontEntry, run: &Run, word: &str, eff_fs: f32) -> f32 {
+    if let Some(cb) = run.checkbox {
+        return checkbox_cell(entry, cb).0;
+    }
+    if run.small_caps {
+        smallcaps_segments(word, eff_fs)
+            .iter()
+            .map(|(seg, fs, _)| spaced_width(entry, run, seg, *fs))
+            .sum()
+    } else {
+        spaced_width(entry, run, word, eff_fs)
+    }
+}
+
+fn spaced_width(entry: &FontEntry, run: &Run, text: &str, fs: f32) -> f32 {
+    entry.scaled_word_width(text, fs, run.kerns_at(fs), run.text_scale)
+        + run.char_spacing * text.chars().count() as f32
+}
+
+/// Width in the run font, size, kerning and spacing.
+fn run_width<'a>(
+    run: &'a Run,
+    seen_fonts: &'a HashMap<String, FontEntry>,
+    key_buf: &mut String,
+) -> impl Fn(&str) -> f32 + Copy + use<'a> {
+    let entry = seen_fonts
+        .get(font_key_buf(run, key_buf))
+        .expect("font registered");
+    let eff_fs = effective_font_size(run, entry);
+    move |w| word_width_for_run(entry, run, w, eff_fs)
+}
+
+/// Record a break-space before the next word on the last glyph chunk laid out
+/// so far (see `WordChunk::space_after`).
+fn mark_space_after(chunks: &mut [WordChunk]) {
+    if let Some(c) = chunks.iter_mut().rev().find(|c| !c.text.is_empty()) {
+        c.space_after = true;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Script {
+    Latin,
+    EastAsian,
+    Complex,
+}
+
+impl Script {
+    pub(super) fn of(ch: char) -> Script {
+        if crate::docx::is_complex_script_char(ch) {
+            Script::Complex
+        } else if crate::docx::is_east_asian_char(ch) {
+            Script::EastAsian
+        } else {
+            Script::Latin
+        }
+    }
+}
+
+/// The language of a run's text: East Asian text's from `w:lang/@eastAsia`,
+/// complex-script text's (Arabic, Hebrew, …) from `@bidi`, the rest from `@val`.
+pub(super) fn run_lang(run: &Run, script: Script) -> Option<&Arc<str>> {
+    match script {
+        Script::Latin => None,
+        Script::EastAsian => run.text_lang_east_asia.as_ref(),
+        Script::Complex => run.text_lang_bidi.as_ref(),
+    }
+    .or(run.text_lang.as_ref())
+}
+
+/// The language of `text` in `run`; only scans the text when the run gives
+/// East Asian or complex-script letters a language of their own.
+fn chunk_lang(run: &Run, text: &str) -> Option<Arc<str>> {
+    let own = |l: &Option<Arc<str>>| l.is_some() && *l != run.text_lang;
+    let script = if own(&run.text_lang_bidi) || own(&run.text_lang_east_asia) {
+        text.chars()
+            .map(Script::of)
+            .find(|&s| s != Script::Latin)
+            .unwrap_or(Script::Latin)
+    } else {
+        Script::Latin
+    };
+    run_lang(run, script).cloned()
+}
+
+/// Where source runs begin inside `word`, when `word` is a slice of the run's
+/// text (caps and other rewrites lose the mapping; they get none).
+fn source_starts(run: &Run, word: &str) -> Vec<usize> {
+    let text = run.text.as_bytes();
+    if word.is_empty() || !text.as_ptr_range().contains(&word.as_ptr()) {
+        return Vec::new();
+    }
+    let at = word.as_ptr() as usize - text.as_ptr() as usize;
+    let lead = text[..at].iter().rev().take_while(|&&b| b == b' ').count();
+    let mut starts: Vec<usize> = std::iter::once(0)
+        .chain(run.source_breaks.iter().copied())
+        .filter(|&b| b + lead >= at && b < at + word.len())
+        // A run's text rewritten after the merge leaves stale offsets.
+        .filter_map(|b| word.get(..b.saturating_sub(at)).map(|s| s.chars().count()))
+        .collect();
+    starts.dedup();
+    starts
+}
+
+/// What every word of a run shares: its font, effective size, character
+/// spacing and super/subscript offset.
+#[derive(Clone, Copy)]
+struct WordRun<'a> {
+    entry: &'a FontEntry,
+    run: &'a Run,
+    eff_fs: f32,
+    cs: f32,
+    y_off: f32,
+}
+
+/// Push WordChunks for a word, splitting into per-segment chunks for smallCaps.
+/// `original` is the word before `w:caps` uppercased it.
+fn push_word_chunks(
+    chunks: &mut Vec<WordChunk>,
+    wr: &WordRun,
+    word: &str,
+    original: Option<&str>,
+    x_start: f32,
+    total_ww: f32,
+    gap_rtl: bool,
+    split_punct: bool,
+) {
+    let WordRun {
+        entry,
+        run,
+        eff_fs,
+        cs,
+        y_off,
+    } = *wr;
+    let first = chunks.len();
+    let original = original.map(soft_shown);
+    let original = original.as_deref();
+    let actual = |shown: &str, source: &str| (shown != source).then(|| source.to_string());
+    if run.small_caps {
+        let segs = smallcaps_segments(word, eff_fs);
+        let mut seg_x = x_start;
+        for (seg_text, seg_fs, source) in &segs {
+            let seg_w = spaced_width(entry, run, seg_text, *seg_fs);
+            let mut chunk = WordChunk::text(entry, run, seg_text, *seg_fs, cs, y_off, seg_x, seg_w);
+            // With caps on too the word is already all capitals, one segment:
+            // its source is the caps original.
+            let source = match original {
+                Some(o) if segs.len() == 1 => o,
+                _ => *source,
+            };
+            chunk.actual_text = actual(seg_text, source);
+            chunks.push(chunk);
+            seg_x += seg_w;
+        }
+    } else if split_punct
+        && original.is_none()
+        && punct_segments(word, run.east_asia_hint).len() > 1
+    {
+        // UAX #14 glues quotes to their neighbours and brackets to a number
+        // (LB30: 2021《), but `compress_punctuation` squeezes a mark only at a
+        // chunk's edge: give each its own.
+        let mut seg_x = x_start;
+        let segs = punct_segments(word, run.east_asia_hint);
+        for (i, seg_text) in segs.iter().enumerate() {
+            let mut seg_w = spaced_width(entry, run, seg_text, eff_fs);
+            let mut chunk = WordChunk::text(entry, run, seg_text, eff_fs, cs, y_off, seg_x, seg_w);
+            // Japanese: a closing mark another mark follows keeps its ink
+            // half only (see `ja_adjacent_marks`).
+            if run_is_japanese(run)
+                && seg_text.chars().last().is_some_and(is_compressible_punct)
+                && segs
+                    .get(i + 1)
+                    .and_then(|next| next.chars().next())
+                    .is_some_and(is_fullwidth_mark)
+            {
+                let cut = 0.5 * eff_fs;
+                seg_w -= cut;
+                chunk.width = seg_w;
+                chunk.punct_compressed = cut;
+            }
+            chunks.push(chunk);
+            seg_x += seg_w;
+        }
+    } else {
+        let mut chunk = WordChunk::text(entry, run, word, eff_fs, cs, y_off, x_start, total_ww);
+        chunk.actual_text = original.and_then(|o| actual(word, o));
+        chunks.push(chunk);
+    }
+    if let Some(c) = chunks.get_mut(first) {
+        c.gap_rtl = gap_rtl;
+    }
+}
+
+fn run_is_japanese(run: &Run) -> bool {
+    run.text_lang_east_asia
+        .as_deref()
+        .is_some_and(|l| l.starts_with("ja"))
+}
+
+fn is_fullwidth_mark(c: char) -> bool {
+    is_compressible_punct(c) || is_compressible_opening(c)
+}
+
+/// Closing marks inside `word` that another full-width mark follows: in
+/// Japanese text each keeps only its ink half, tight line or not (JIS X 4051;
+/// japanese_medical's "院）・専門" draws the ） 5.25pt wide in 10.5pt text on
+/// a line 13pt short of the measure).
+fn ja_adjacent_marks(word: &str) -> usize {
+    word.chars()
+        .zip(word.chars().skip(1))
+        .filter(|&(a, b)| is_compressible_punct(a) && is_fullwidth_mark(b))
+        .count()
+}
+
+/// `word` cut before each compressible opening mark and after each closing
+/// one (the curly quotes only count in a `hint="eastAsia"` run).
+fn punct_segments(word: &str, hint: bool) -> Vec<&str> {
+    let mut segs = Vec::new();
+    let mut start = 0;
+    for (i, c) in word.char_indices() {
+        if (is_compressible_opening(c) || (hint && hinted_opening(c))) && i > start {
+            segs.push(&word[start..i]);
+            start = i;
+        }
+        if is_compressible_punct(c) || (hint && hinted_closing(c)) {
+            let end = i + c.len_utf8();
+            segs.push(&word[start..end]);
+            start = end;
+        }
+    }
+    if start < word.len() {
+        segs.push(&word[start..]);
+    }
+    segs
+}
+
+fn vert_y_offset(run: &Run) -> f32 {
+    run.position
+        + match run.vertical_align {
+            VertAlign::Superscript => run.font_size * 0.35,
+            VertAlign::Subscript => -run.font_size * 0.14,
+            VertAlign::Baseline => 0.0,
+        }
+}
+
+const DEFAULT_TAB_INTERVAL: f32 = 36.0; // 0.5 inches
+
+fn is_cjk_punctuation(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3000..=0x303F  // CJK Symbols and Punctuation (includes ，。、)
+        | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
+        | 0xFE30..=0xFE4F // CJK Compatibility Forms
+    )
+}
+
+fn finish_line(chunks: &mut Vec<WordChunk>) -> TextLine {
+    let total_width = chunks.last().map(|c| c.x_offset + c.width).unwrap_or(0.0);
+    TextLine {
+        chunks: std::mem::take(chunks),
+        total_width,
+        ..TextLine::default()
+    }
+}
+
+fn finish_line_with_break(chunks: &mut Vec<WordChunk>) -> TextLine {
+    let mut line = finish_line(chunks);
+    line.ends_with_break = true;
+    line
+}
+
+/// One run's share of the spaces waiting to be placed before the next word,
+/// for `underline_line_end`.
+struct PendingSpaceRun<'a> {
+    run: &'a Run,
+    entry: &'a FontEntry,
+    font_size: f32,
+    width: f32,
+}
+
+/// A space is underlined when its *own* run is underlined (Word draws
+/// underline continuously across spaces inside an underlined run, but not
+/// across a space that belongs to a neighbouring non-underlined run). A struck
+/// run (a deletion): Word's strike bridges the space.
+fn underlines_space(run: &Run) -> bool {
+    underlines_spaces(run) || run.strikethrough || run.dstrike
+}
+
+/// An underline that also runs under spaces: all but `words`.
+fn underlines_spaces(run: &Run) -> bool {
+    run.underline && run.underline_style != crate::model::UnderlineStyle::Words
+}
+
+fn space_underline(
+    run: Option<&Run>,
+    entry: &FontEntry,
+    font_size: f32,
+    x: f32,
+    width: f32,
+) -> Option<WordChunk> {
+    let run = run.filter(|r| underlines_space(r))?;
+    let chunk = WordChunk::word_space_underline(
+        entry,
+        font_size,
+        run.underline_color.or(run.color),
+        run.underline_style,
+        run.border.clone(),
+        x,
+        width,
+    );
+    Some(chunk.struck_like(run))
+}
+
+/// Record `width` of spaces from `run` and add it to `pending_w`, the space
+/// already waiting, zero when the spaces recorded before were placed.
+fn push_pending_space<'a>(
+    spaces: &mut Vec<PendingSpaceRun<'a>>,
+    pending_w: &mut f32,
+    run: &'a Run,
+    entry: &'a FontEntry,
+    font_size: f32,
+    width: f32,
+) {
+    if *pending_w == 0.0 {
+        spaces.clear();
+    }
+    *pending_w += width;
+    spaces.push(PendingSpaceRun {
+        run,
+        entry,
+        font_size,
+        width,
+    });
+}
+
+/// `w:compat/w:ulTrailSpace`: Word underlines the underlined spaces a line
+/// ends in, at a wrap, a manual break, before a wrapped picture and at the
+/// paragraph mark alike, each in its own run's underline, but never past the
+/// line's edge, so a stretched justified line or one aligned to its end shows
+/// none of them (Word examples, `ul-trail-space-on`,
+/// `ul-trail-space-runs`). A line of spaces only is underlined from its start,
+/// in a table cell too; the spaces still leave the line as tall as the
+/// paragraph mark makes it. They do not count for alignment or justification,
+/// and in a `w:bidi` paragraph, tabbed or not, they sit left of the line
+/// (`ul-trail-space-bidi`). Only spaces in
+/// the paragraph's direction trail: a `w:rtl` run's spaces in a left-to-right
+/// paragraph, or a plain run's in a `w:bidi` one, stay inside the line and
+/// are underlined with or without the flag. Without it the underline stops
+/// at the last visible character.
+fn underline_line_end(
+    line: &mut TextLine,
+    cjk: CjkLayout,
+    spaces: &[PendingSpaceRun],
+    mut x: f32,
+    pending_w: f32,
+) {
+    if !cjk.ul_trail_space || pending_w <= 0.0 {
+        return;
+    }
+    for sp in spaces {
+        if underlines_spaces(sp.run) && sp.run.rtl == cjk.bidi {
+            let x_offset = if cjk.bidi {
+                line.total_width - x - sp.width
+            } else {
+                x
+            };
+            line.end_spaces.push(EndSpace {
+                x_offset,
+                width: sp.width,
+                pdf_font: sp.entry.pdf_name.clone(),
+                font_size: sp.font_size,
+                color: sp.run.underline_color.or(sp.run.color),
+                style: sp.run.underline_style,
+            });
+        }
+        x += sp.width;
+    }
+}
+
+/// Paragraph line-breaking switches for `build_paragraph_lines`.
+#[derive(Clone, Copy)]
+pub(super) struct CjkLayout {
+    /// `w:autoSpaceDE`/`DN`: quarter-em gap where Latin text meets ideographs.
+    pub(super) auto_space: bool,
+    /// `w:characterSpacingControl compressPunctuation`: squeeze full-width
+    /// punctuation to keep one more character on the line.
+    pub(super) compress_punct: bool,
+    /// `w:balanceSingleByteDoubleByteWidth`: a space beside an East Asian
+    /// character on either side is half an em wide, whatever its font's space
+    /// glyph (Word online probes 2026-11-09: 6.0pt at 12pt and 5.25 at 10.5
+    /// with the flag, the Latin 3.0 / 2.73 without; Yu Mincho, SimSun and
+    /// Times New Roman alike; japanese_land_development_sign_form).
+    pub(super) balance_sbdb: bool,
+    /// Whether this paragraph pulls a word up by squeezing (see `CjkLayout`
+    /// construction: the 2013+ layout only when justified).
+    pub(super) punct_pull: bool,
+    /// The 2010 layout (compatibilityMode 14) squeezes the closing mark of
+    /// the word being pulled up as well (chinese_costume_design_course: its
+    /// line-final 。 and the comma before it both give 0.5 em).
+    pub(super) punct_cut_last: bool,
+    /// A word is pulled up only while this share of the measure is free
+    /// before it, and this many ems of its font free before it including
+    /// its autoSpaceDE gap (one of the two is 0 per compatibility mode, see
+    /// `PUNCT_PULL_FREE`).
+    pub(super) punct_pull_free_ratio: f32,
+    pub(super) punct_pull_free_em: f32,
+    /// Justified paragraph under Word 2013+ layout (compatibilityMode 15): a
+    /// word that overflows stays on the line when `squeeze_keeps` allows it
+    /// and the line's spaces can shrink to make room (see `SPACE_SQUEEZE`).
+    pub(super) squeeze_spaces: bool,
+    /// Chinese, Japanese or Korean document: a word ending in a Latin mark
+    /// may overflow by half the mark on top of what `squeeze_keeps` allows
+    /// (Word online probes 2026-10-28: "barn." stays 1.5pt longer with
+    /// eastAsia zh-CN than en-US, "barnx" the same in both; issue #142).
+    /// The 25% space cap is not widened: slovak_misdemeanor_amendment (zh-CN
+    /// defaults) wraps "predstaviteľov." at 28% of its spaces in Word.
+    pub(super) punct_half_out: bool,
+    /// Justified paragraph under `wpJustification`: a word that overflows by
+    /// at most two spaces' width stays, and the whole line is squeezed
+    /// (`SQUEEZE_LINE_SPACES`).
+    pub(super) squeeze_line: bool,
+    /// `Paragraph::kashida_reserve`: taken off the width lines are broken to.
+    pub(super) line_reserve: f32,
+    /// Justify a line that ends in a manual break, as Word does unless
+    /// `doNotExpandShiftReturn` is set.
+    pub(super) expand_shift_return: bool,
+    /// Underline the underlined spaces a line ends in (`ulTrailSpace`).
+    pub(super) ul_trail_space: bool,
+    /// `w:bidi`: the paragraph's base direction is right to left.
+    pub(super) bidi: bool,
+    /// `enableOpenTypeFeatures`: kerned text goes through Word's shaping path
+    /// (see `TextLine::shaped_kerning`).
+    pub(super) shaped_kerning: bool,
+    /// `Paragraph::break_words`.
+    pub(super) break_words: bool,
+}
+
+/// How far Word 2013+ narrows the spaces of a justified line to keep its
+/// last word: to 75% of their width. Measured, not from the spec: over 4,216
+/// squeezed lines in 207 Word PDFs the per-line space ratio piles up at 0.75
+/// with almost nothing below it, and only compat-15 documents squeeze. Of
+/// 14,122 line-end decisions in those PDFs, "within this cap and the word's
+/// midpoint inside the margin" reproduces 94.6%; either condition alone ~90%.
+const SPACE_SQUEEZE: f32 = 0.25;
+
+/// Whether Word 2013+ keeps an overflowing word on a squeezed line:
+/// `overflow * (3 - 2 * share) <= word_w + lead_space`, less a slack,
+/// `share` being the lead space's part of the line's `spaces` (lead space
+/// included); after a hyphen that is a third of the word. Word examples:
+/// 12 and 24 pt words after a hyphen stay to 4.0 and 8.0 pt over; Arial 11 pt
+/// "der" after 10, 20 and 30 spaces to 6.76, 6.53 and 6.44 pt, wrapping at
+/// 6.81, 6.58 and 6.49 (fixture squeeze-lead-space).
+fn squeeze_keeps(overflow: f32, word_w: f32, lead_space: f32, spaces: f32) -> bool {
+    let share = if spaces > 0.0 {
+        lead_space / spaces
+    } else {
+        0.0
+    };
+    (overflow - SQUEEZE_KEEP_SLACK) * (3.0 - 2.0 * share) <= word_w + lead_space
+}
+
+/// Word keeps a squeezed line's last word a little past `squeeze_keeps`'s
+/// threshold: Word examples in 0.0004pt steps (Arial 11pt "der"
+/// after 9 to 46 spaces, Times New Roman "te" and "Dále", Calibri "der")
+/// put it 0.0007 to 0.022pt further, more the more spaces the line has but
+/// not steadily, a rounding not pinned down. This much is below every example;
+/// czech_village_budget_commentary keeps "Dále" 0.00016pt past the threshold.
+const SQUEEZE_KEEP_SLACK: f32 = 0.0005;
+
+/// How far a `wpJustification` line may overflow and still keep its last
+/// word, in spaces of the word's font. Measured on three compat-14 Courier
+/// New statute documents: 58 squeezed lines all overflow by two characters
+/// or less (letters and spaces narrowed alike, to 0.965-0.985), none by
+/// three; the cap sits between the two. ponytail: a few lines one character
+/// over still wrap in Word, which no width cap explains; find that rule if
+/// a proportional-font document turns up.
+const SQUEEZE_LINE_SPACES: f32 = 2.5;
+
+/// Per chunk, how many word spaces precede it on the line. Justification
+/// stretches or squeezes those, not the joins between runs inside a word: a
+/// space is a gap between chunks or a chunk that is itself a space (spaces
+/// carrying underline or shading are text-less chunks of their own).
+pub(super) fn spaces_before_each(chunks: &[WordChunk]) -> Vec<usize> {
+    chunks
+        .iter()
+        .scan((0usize, None::<(f32, bool)>), |(n, prev), c| {
+            if prev.is_some_and(|(end, was_space)| was_space || c.x_offset > end + 0.01) {
+                *n += c.preceding_spaces;
+            }
+            let is_space = c.inline_image_name.is_none() && c.text.chars().all(is_break_space);
+            *prev = Some((c.x_offset + c.width, is_space));
+            Some(*n)
+        })
+        .collect()
+}
+
+/// Total inter-word space already on a line: the gaps between its chunks.
+fn line_space_width(chunks: &[WordChunk]) -> f32 {
+    let gaps: f32 = chunks
+        .windows(2)
+        .map(|w| (w[1].x_offset - (w[0].x_offset + w[0].width)).max(0.0))
+        .sum();
+    gaps + chunks
+        .iter()
+        .filter(|chunk| chunk.word_space_bridge)
+        .map(|chunk| chunk.width)
+        .sum::<f32>()
+}
+
+/// Full-width East Asian closing punctuation whose right half is blank, which
+/// Word's `compressPunctuation` may squeeze (§17.15.1.15). The middle dot,
+/// blank on both sides, squeezes like them.
+fn is_compressible_punct(c: char) -> bool {
+    matches!(
+        c,
+        '、' | '。'
+            | '，'
+            | '．'
+            | '：'
+            | '；'
+            | '！'
+            | '？'
+            | '）'
+            | '］'
+            | '｝'
+            | '」'
+            | '』'
+            | '】'
+            | '〕'
+            | '〉'
+            | '》'
+            | '〙'
+            | '〗'
+            | '・'
+    )
+}
+
+/// Full-width opening brackets, blank on their left, which `compressPunctuation`
+/// squeezes from that side: japanese_medical's "（" sits 2pt into the gap
+/// before it on a tight line.
+fn is_compressible_opening(c: char) -> bool {
+    matches!(
+        c,
+        '（' | '［' | '｛' | '「' | '『' | '【' | '〔' | '〈' | '《' | '〘' | '〖'
+    )
+}
+
+/// Hinted curly quotes squeeze like the brackets: ‘“ from the left, ’” from
+/// the right.
+fn hinted_closing(c: char) -> bool {
+    matches!(c, '’' | '”')
+}
+fn hinted_opening(c: char) -> bool {
+    matches!(c, '‘' | '“')
+}
+
+/// How much of its em a full-width mark gives up to `compressPunctuation` at
+/// most under the Word 2013+ layout: half, whatever its glyph (a KaiTi
+/// comma's blank right half is 0.7 em and never comes into it). Every mark on
+/// the line gives the same amount. Word online probes, 2026-10-26 (issue
+/// #139): 12pt KaiTi lines with 2 to 8 commas or curly quotes before a Latin
+/// word, 10.5 to 22pt, word widths of 1 to 4.5 em; 3 marks take 6.0pt each
+/// and refuse 6.65pt. The 2010 layout (compatibilityMode 14) squeezes any
+/// alignment and stops at the same half (probes 2026-11-09: SimSun, YaHei and
+/// KaiTi commas at 9-16pt; the earlier 0.4 em read the autoSpaceDE gap's
+/// share, which shrinks next, as the mark's).
+pub(super) const PUNCT_SQUEEZE: f32 = 0.5;
+
+/// Word 2013+ pulls a word up by squeezing marks only when the line before it
+/// still has this share of the measure free (same probes: 12pt lines of 20
+/// to 40 glyphs, measures of 240 to 510pt, pull at 1.22% free and wrap at
+/// 1.19% whatever the word's width). A nearly full line wraps the word
+/// instead, however little the marks would have to give. The 2010 layout
+/// asks for half an em instead, whatever the measure, and counts the word's
+/// autoSpaceDE gap as used (12pt pulls "SN/T" at 6.7pt free past the gap and
+/// wraps it at 5.8 on 250 and 490pt lines alike; taiwanese_education_fraud_
+/// ruling pulls 業 at 8.1pt free, 16pt).
+pub(super) const PUNCT_PULL_FREE: f32 = 0.012;
+
+/// Recover `needed` points on the current line by trimming the chunks that end
+/// in compressible punctuation, the same amount off every mark (counting what
+/// earlier words on the line already took) and at most `cap` of the em.
+/// Returns false and touches nothing when that is not enough.
+/// `incoming` is the font size of the word being placed when its own closing
+/// mark joins in (the 2010 layout: chinese_costume_design_course's "…使用。"
+/// gives 0.5 em on its comma and on that final mark). Returns that word's cut
+/// (0 without one), or None, touching nothing, when the marks cannot give enough.
+fn compress_punctuation(chunks: &mut [WordChunk], needed: f32, incoming: Option<f32>) -> Option<f32> {
+    // (chunk, squeezes at its end, squeezes at its start)
+    let marks: Vec<(usize, f32, bool)> = chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.inline_image_name.is_none())
+        .map(|(i, c)| {
+            let end = c.text.chars().last().is_some_and(|ch| {
+                is_compressible_punct(ch) || (c.east_asia_hint && hinted_closing(ch))
+            });
+            let start = c.text.chars().next().is_some_and(|ch| {
+                is_compressible_opening(ch) || (c.east_asia_hint && hinted_opening(ch))
+            });
+            (i, end as u8 as f32 + start as u8 as f32, start)
+        })
+        .filter(|&(_, sides, _)| sides > 0.0)
+        .collect();
+    let sides_total: f32 =
+        marks.iter().map(|&(_, sides, _)| sides).sum::<f32>() + incoming.is_some() as u8 as f32;
+    if needed <= 0.0 || sides_total == 0.0 {
+        return None;
+    }
+    let taken: f32 = marks
+        .iter()
+        .map(|&(i, _, _)| chunks[i].punct_compressed)
+        .sum();
+    let level = (taken + needed) / sides_total;
+    let over_cap = |fs: f32| level > fs * PUNCT_SQUEEZE + 0.01;
+    if marks.iter().any(|&(i, _, _)| over_cap(chunks[i].font_size)) || incoming.is_some_and(over_cap)
+    {
+        return None;
+    }
+    let mut shift = 0.0;
+    let mut k = 0;
+    for (i, chunk) in chunks.iter_mut().enumerate() {
+        chunk.x_offset -= shift;
+        if k < marks.len() && marks[k].0 == i {
+            let (_, sides, start) = marks[k];
+            let cut = (level * sides - chunk.punct_compressed).max(0.0);
+            // An opening bracket loses its blank left: the chunk slides into
+            // the gap before it by its share of the cut, and only the rest
+            // comes off its right end.
+            let lead = if start { cut / sides } else { 0.0 };
+            chunk.x_offset -= lead;
+            chunk.width -= cut - lead;
+            chunk.punct_compressed += cut;
+            shift += cut;
+            k += 1;
+        }
+    }
+    Some(incoming.map_or(0.0, |_| level))
+}
+
+/// Dual-region geometry for bothSides wrapping: (left_x, left_w, right_x, right_w).
+/// For lines outside the float zone, right_w is 0.0 (single region).
+pub(super) type DualRegion = (f32, f32, f32, f32);
+
+/// What line breaking takes besides the runs and the measure of a paragraph.
+/// The default is a plain paragraph: no pictures, tab stops, indents or floats.
+#[derive(Default, Clone, Copy)]
+pub(super) struct LineOpts<'a> {
+    /// Inline pictures and their effect XObjects, by run index.
+    pub(super) inline_images: Option<&'a HashMap<usize, String>>,
+    pub(super) effects: Option<&'a HashMap<usize, EffectXObjs>>,
+    pub(super) tab_stops: &'a [TabStop],
+    pub(super) indent_left: f32,
+    pub(super) indent_right: f32,
+    pub(super) hanging: f32,
+    /// Spans a left tab skips (see `build_tabbed_line`).
+    pub(super) tab_exclusions: &'a [(f32, f32)],
+    /// The measure of each line beside a float (see `build_paragraph_lines`).
+    pub(super) per_line_widths: Option<&'a [f32]>,
+    pub(super) dual: Option<&'a [DualRegion]>,
+}
+
+/// Run widths Word sets from the text itself, before line breaking: ruby
+/// bases and fitText regions (borrowed when there are none). `line_width`
+/// is the width a tcFitText cell's paragraphs fill.
+/// ponytail: table autofit (`min_content_widths`) measures the bare runs.
+fn prepare_runs<'r>(
+    runs: &'r [Run],
+    fonts: &HashMap<String, FontEntry>,
+    line_width: f32,
+) -> Cow<'r, [Run]> {
+    if !runs
+        .iter()
+        .any(|r| r.ruby.is_some() || r.fit_text.is_some())
+    {
+        return Cow::Borrowed(runs);
+    }
+    let runs = widen_ruby_bases(runs, fonts);
+    Cow::Owned(fit_text_regions(&runs, fonts, line_width))
+}
+
+/// A ruby's base text spreads over its guide's width when the guide is the
+/// wider (torture_test's 東京 under とうきょう: the base glyphs sit 2.75pt
+/// apart). ponytail: per run, Word's distributeSpace puts half a gap before
+/// the first glyph, and we put it all after the last.
+fn widen_ruby_bases(runs: &[Run], fonts: &HashMap<String, FontEntry>) -> Vec<Run> {
+    let mut runs = runs.to_vec();
+    for run in &mut runs {
+        let (Some(ruby), Some(entry)) = (&run.ruby, fonts.get(&crate::fonts::font_key(run))) else {
+            continue;
+        };
+        let n = run.text.chars().count() as f32;
+        let free =
+            entry.word_width(&ruby.text, ruby.font_size, false) - segment_width(&[run], fonts);
+        if free > 0.0 && n > 0.0 {
+            run.char_spacing += free / n;
+        }
+    }
+    runs
+}
+
+/// A fitText region's letters get equal gaps that make it exactly its width,
+/// none after the last: Word replaces any cached w:spacing
+/// (japanese_hr_consultation's 氏名, 30pt apart in a 48pt region).
+fn fit_text_regions(runs: &[Run], fonts: &HashMap<String, FontEntry>, line_width: f32) -> Vec<Run> {
+    let mut out = Vec::with_capacity(runs.len() + 1);
+    for region in runs.chunk_by(|a, b| a.fit_text.is_some() && a.fit_text == b.fit_text) {
+        let n: usize = region.iter().map(|r| r.text.chars().count()).sum();
+        let Some(fit) = region[0].fit_text.filter(|_| n > 1) else {
+            out.extend_from_slice(region);
+            continue;
+        };
+        let start = out.len();
+        out.extend(region.iter().map(|r| Run {
+            char_spacing: 0.0,
+            ..r.clone()
+        }));
+        let bare: Vec<&Run> = out[start..].iter().collect();
+        let gap = (fit.width.unwrap_or(line_width) - segment_width(&bare, fonts)) / (n - 1) as f32;
+        for run in &mut out[start..] {
+            run.char_spacing = gap;
+        }
+        // The last letter takes no gap after it.
+        let mut tail = out.pop().expect("region is non-empty");
+        let i = tail.text.char_indices().last().map_or(0, |(i, _)| i);
+        if i > 0 {
+            out.push(Run {
+                text: tail.text[..i].to_string(),
+                ..tail.clone()
+            });
+            tail.text.drain(..i);
+        }
+        tail.char_spacing = 0.0;
+        out.push(tail);
+    }
+    out
+}
+
+/// Lay a paragraph out as lines: against its tab stops when it holds a tab,
+/// by plain word wrapping otherwise.
+pub(super) fn build_lines(
+    runs: &[Run],
+    ctx: &RenderContext,
+    width: f32,
+    cjk: CjkLayout,
+    opts: &LineOpts<'_>,
+) -> Vec<TextLine> {
+    let inline_images = opts.inline_images.unwrap_or(&EMPTY_INLINE_IMAGES);
+    let effects = opts.effects.unwrap_or(&EMPTY_EFFECTS);
+    let width = (width - cjk.line_reserve).max(1.0);
+    if runs.iter().any(|r| r.is_tab) {
+        build_tabbed_line(
+            runs,
+            ctx.fonts,
+            opts.tab_stops,
+            opts.indent_left,
+            width,
+            opts.indent_right,
+            opts.hanging,
+            inline_images,
+            effects,
+            ctx.default_tab_stop,
+            opts.tab_exclusions,
+            ctx.compat_mode,
+            cjk,
+        )
+    } else {
+        build_paragraph_lines(
+            runs,
+            ctx.fonts,
+            width,
+            opts.hanging,
+            inline_images,
+            effects,
+            None,
+            opts.per_line_widths,
+            opts.dual,
+            cjk,
+        )
+    }
+}
+
+/// Layout runs into wrapped lines.
+/// Handles cross-run contiguous text correctly: no space is inserted between
+/// runs unless the preceding text ended with whitespace or the new run starts
+/// with whitespace (e.g., "bold" + ", " → "bold," not "bold ,").
+/// `width_after_line`: after building this many lines, switch to a different
+/// max_width (used for text wrapping around floating tables where lines beside
+/// the table are narrow, then lines below it expand to full column width).
+pub(super) fn build_paragraph_lines(
+    runs: &[Run],
+    seen_fonts: &HashMap<String, FontEntry>,
+    max_width: f32,
+    first_line_hanging: f32,
+    inline_image_names: &HashMap<usize, String>,
+    effect_inline_names: &HashMap<usize, super::images::EffectXObjs>,
+    width_after_line: Option<(usize, f32)>,
+    per_line_widths: Option<&[f32]>,
+    per_line_dual: Option<&[DualRegion]>,
+    cjk: CjkLayout,
+) -> Vec<TextLine> {
+    let runs = &*prepare_runs(runs, seen_fonts, max_width);
+    let mut lines: Vec<TextLine> = Vec::new();
+    // Indices of lines that kept a word by squeezing their spaces.
+    let mut squeezed_lines: Vec<usize> = Vec::new();
+    let mut current_chunks: Vec<WordChunk> = Vec::new();
+    // A display equation broke over lines (see the group alignment below).
+    let mut display_wrapped = false;
+    let mut current_x: f32 = 0.0;
+    let mut pending_space_w: f32 = 0.0;
+    let mut pending_space_count: usize = 0;
+    let mut prev_border: Option<&crate::model::ParagraphBorder> = None;
+    // pending_space_w minus CJK auto-spacing: a space character really occurred.
+    let mut pending_real_space = false;
+    // The run that emitted the pending whitespace: its underline and its
+    // `w:rtl` (`WordChunk::gap_rtl`) apply to the spaces.
+    let mut last_space_run: Option<&Run> = None;
+    let mut pending_spaces: Vec<PendingSpaceRun> = Vec::new();
+    let mut key_buf = String::new();
+    // Track whether we're filling the right region on the current line
+    let mut in_right_region = false;
+    // Info for the right region of the current line being built
+    let mut cur_right_info: Option<(usize, f32, f32)> = None; // (first_chunk_idx, region_x, region_w)
+    // Track last non-space character for CJK auto-spacing (autoSpaceDE/DN)
+    let mut prev_last_char: Option<char> = None;
+    // The width of the hyphen a soft hyphen showed at the end of the word
+    // placed last (`shown_word`).
+    let mut soft_tail: Option<f32> = None;
+    // Index in `current_chunks` where the word being placed began; a word can
+    // span several runs.
+    let mut word_start = 0usize;
+
+    // Lines beside a float that cannot hold the first word are left out: the
+    // paragraph's first line is the first that can (`float_skip`).
+    let skip = std::cell::Cell::new(0usize);
+    let left_max = |line_count: usize| -> f32 {
+        let line_count = line_count + skip.get();
+        if let Some(dual) = per_line_dual
+            && let Some(&(_, lw, _, _)) = dual.get(line_count)
+        {
+            return lw;
+        }
+        if let Some(widths) = per_line_widths {
+            if let Some(&w) = widths.get(line_count) {
+                return w;
+            }
+            return max_width;
+        }
+        match width_after_line {
+            Some((n, w)) if line_count >= n => w,
+            _ => max_width,
+        }
+    };
+    // A line's right limit: the right region's width once a float pushed it
+    // beside one, else the measure (plus the first line's hanging part).
+    let cur_max_at = |n_lines: usize, in_right: bool, right_info: Option<(usize, f32, f32)>| {
+        let eff_w = left_max(n_lines);
+        if in_right {
+            right_info.map(|(_, _, rw)| rw).unwrap_or(eff_w)
+        } else if n_lines == 0 {
+            eff_w + first_line_hanging
+        } else {
+            eff_w
+        }
+    };
+
+    let right_region_for = |line_count: usize| -> Option<(f32, f32, f32)> {
+        per_line_dual.and_then(|dual| {
+            dual.get(line_count + skip.get())
+                .and_then(|&(_, _, rx, rw)| {
+                    // The first line gets its first-line/hanging shift like the
+                    // left region does (`eff_margin` in render_paragraph_lines).
+                    let shift = if line_count == 0 {
+                        first_line_hanging
+                    } else {
+                        0.0
+                    };
+                    let rw = rw + shift;
+                    (rw > 0.0).then_some((rx - shift, rw, rw))
+                })
+        })
+    };
+
+    // Finish current line, recording right-region info if applicable
+    let finish_dual_line = |chunks: &mut Vec<WordChunk>,
+                            in_right: &mut bool,
+                            right_info: &mut Option<(usize, f32, f32)>|
+     -> TextLine {
+        let mut line = finish_line(chunks);
+        if let Some((first_idx, rx, rw)) = right_info.take() {
+            let content_w = line.chunks[first_idx..]
+                .last()
+                .map(|c| c.x_offset + c.width)
+                .unwrap_or(0.0);
+            line.right_region = Some(RightRegion {
+                first_chunk_idx: first_idx,
+                region_x: rx,
+                region_width: rw,
+                content_width: content_w,
+            });
+        }
+        *in_right = false;
+        line
+    };
+
+    for (run_idx, run) in runs.iter().enumerate() {
+        if run.vanish {
+            continue;
+        }
+        // Tabs and breaks move the pen without a glyph; extraction still needs
+        // the word boundary, as Word's text has one there.
+        if run.is_tab {
+            pending_real_space = true;
+            continue;
+        }
+
+        if run.is_line_break {
+            drop_soft_hyphen(&mut current_chunks, soft_tail.take());
+            mark_space_after(&mut current_chunks);
+            let holds_only_break = current_chunks
+                .iter()
+                .all(|c| c.text.trim().is_empty() && c.inline_image_name.is_none());
+            let line = finish_dual_line(
+                &mut current_chunks,
+                &mut in_right_region,
+                &mut cur_right_info,
+            );
+            let mut line = TextLine {
+                ends_with_break: true,
+                break_font_size: holds_only_break.then_some(run.font_size),
+                break_lhr: holds_only_break
+                    .then(|| seen_fonts.get(&crate::fonts::font_key(run)))
+                    .flatten()
+                    .and_then(|e| e.line_h_ratio),
+                ..line
+            };
+            underline_line_end(&mut line, cjk, &pending_spaces, current_x, pending_space_w);
+            lines.push(line);
+            current_x = 0.0;
+            pending_space_w = 0.0;
+            pending_space_count = 0;
+            pending_real_space = false;
+            prev_last_char = None;
+            continue;
+        }
+
+        // Handle inline images as single block elements in the line
+        if let Some(img) = &run.inline_image {
+            if std::mem::take(&mut pending_real_space) {
+                mark_space_after(&mut current_chunks);
+            }
+            if let Some(pdf_name) = inline_image_names.get(&run_idx) {
+                let img_w = img.layout_size().0;
+                let soft = soft_tail.take().filter(|_| {
+                    pending_space_w == 0.0
+                        && current_chunks.last().is_some_and(|c| c.text.ends_with('-'))
+                });
+                // Leading spaces indent a picture as they do a word
+                // (russian_chess: 19 spaces push the board 57pt right).
+                let proposed_x = current_x + pending_space_w - soft.unwrap_or(0.0);
+
+                let cur_max = cur_max_at(lines.len(), in_right_region, cur_right_info);
+                if (!current_chunks.is_empty() || pending_space_w > 0.0)
+                    && proposed_x + img_w > cur_max
+                {
+                    if !in_right_region && let Some((rx, rw, _)) = right_region_for(lines.len()) {
+                        cur_right_info = Some((current_chunks.len(), rx, rw));
+                        in_right_region = true;
+                        pending_space_w = 0.0;
+                        pending_space_count = 0;
+                        // Retry placement in right region
+                        let proposed_x2 = 0.0;
+                        if proposed_x2 + img_w <= rw {
+                            current_chunks.push(WordChunk::image(
+                                pdf_name,
+                                run,
+                                proposed_x2,
+                                img,
+                                effect_inline_names.get(&run_idx).cloned(),
+                                seen_fonts
+                                    .get(font_key_buf(run, &mut key_buf))
+                                    .map_or_else(String::new, |e| e.pdf_name.clone()),
+                            ));
+                            current_x = img_w;
+                            continue;
+                        }
+                    }
+                    let leading_space_run = current_chunks
+                        .is_empty()
+                        .then(|| runs[..run_idx].iter().rev().find(|r| !r.text.is_empty()))
+                        .flatten();
+                    let mut line = finish_dual_line(
+                        &mut current_chunks,
+                        &mut in_right_region,
+                        &mut cur_right_info,
+                    );
+                    if let Some(space_run) = leading_space_run {
+                        let entry = seen_fonts
+                            .get(font_key_buf(space_run, &mut key_buf))
+                            .expect("font registered");
+                        line.break_font_size = Some(effective_font_size(space_run, entry));
+                        line.break_lhr = entry.line_h_ratio;
+                        line.leading_space_wrap = true;
+                    }
+                    underline_line_end(&mut line, cjk, &pending_spaces, current_x, pending_space_w);
+                    lines.push(line);
+                    current_x = 0.0;
+                } else {
+                    drop_soft_hyphen(&mut current_chunks, soft);
+                    current_x = proposed_x;
+                }
+                pending_space_w = 0.0;
+                pending_space_count = 0;
+
+                current_chunks.push(WordChunk::image(
+                    pdf_name,
+                    run,
+                    current_x,
+                    img,
+                    effect_inline_names.get(&run_idx).cloned(),
+                    seen_fonts
+                        .get(font_key_buf(run, &mut key_buf))
+                        .map_or_else(String::new, |e| e.pdf_name.clone()),
+                ));
+                current_x += img_w;
+                word_start = current_chunks.len();
+                // A picture is an object character: a line may break after
+                // it (UAX #14 LB20), so the text glued to it can wrap (Word
+                // moves "Step" below a full-width banner picture).
+                prev_last_char = Some('\u{FFFC}');
+            }
+            continue;
+        }
+
+        if let Some((entry, mb)) = math_box(run, seen_fonts) {
+            // A math zone is one box, glued to text it touches without a
+            // space: Word wraps pendulum's "cambiando la lunghezza 𝑙 del
+            // filo" before the zone "𝑙 " since nothing may break before "del".
+            let glued = pending_space_w == 0.0
+                && !current_chunks.is_empty()
+                && !prev_last_char.is_some_and(|a| breaks_between(a, 'x'));
+            let mut start = if glued {
+                word_start
+            } else {
+                current_chunks.len()
+            };
+            let proposed_x = current_x + pending_space_w;
+            let cur_max = cur_max_at(lines.len(), in_right_region, cur_right_info);
+            current_x = proposed_x;
+            // A zone too long for the line breaks after one of its operators,
+            // as many times as it takes; what is left places like a whole zone.
+            let mut mb = mb.clone();
+            let free = |lines: &[TextLine], x: f32| {
+                if lines.is_empty() {
+                    left_max(0) + first_line_hanging - x
+                } else {
+                    left_max(lines.len()) - x
+                }
+            };
+            if !in_right_region && right_region_for(lines.len()).is_none() {
+                while let Some((head, tail)) = Some(free(&lines, current_x) + 0.05)
+                    .filter(|&room| mb.width > room)
+                    .and_then(|room| mb.fit(room))
+                {
+                    if pending_space_w > 0.0 {
+                        mark_space_after(&mut current_chunks);
+                        pending_space_w = 0.0;
+                    }
+                    current_chunks.push(WordChunk::math(entry, run, &Arc::new(head), current_x));
+                    let line = finish_dual_line(
+                        &mut current_chunks,
+                        &mut in_right_region,
+                        &mut cur_right_info,
+                    );
+                    lines.push(line);
+                    // A display equation's continuation lines start at
+                    // m:wrapIndent (72pt by default: probe `mp17_wrap`).
+                    (current_x, start) = (if mb.display { mb.wrap_indent } else { 0.0 }, 0);
+                    display_wrapped |= mb.display;
+                    mb = Arc::new(tail);
+                }
+            }
+            let mb = &mb;
+            if start > 0
+                && current_x + mb.width > cur_max + 0.05
+                && !in_right_region
+                && right_region_for(lines.len()).is_none()
+            {
+                let carried: Vec<WordChunk> = current_chunks.drain(start..).collect();
+                let dx = carried.first().map_or(current_x, |c| c.x_offset);
+                let line = finish_dual_line(
+                    &mut current_chunks,
+                    &mut in_right_region,
+                    &mut cur_right_info,
+                );
+                lines.push(line);
+                current_chunks.extend(carried.into_iter().map(|mut c| {
+                    c.x_offset -= dx;
+                    c
+                }));
+                current_x -= dx;
+                start = 0;
+            }
+            if pending_space_w > 0.0 {
+                mark_space_after(&mut current_chunks);
+            }
+            pending_space_w = 0.0;
+            current_chunks.push(WordChunk::math(entry, run, mb, current_x));
+            current_x += mb.width;
+            word_start = start;
+            // Text right after the zone continues its word.
+            prev_last_char = Some('x');
+            continue;
+        }
+
+        let key = font_key_buf(run, &mut key_buf);
+        let entry = seen_fonts.get(key).expect("font registered");
+        let eff_fs = effective_font_size(run, entry);
+        let text = &run.text;
+        let wr = WordRun {
+            entry,
+            run,
+            eff_fs,
+            cs: run.char_spacing,
+            y_off: vert_y_offset(run),
+        };
+        let width = run_width(run, seen_fonts, &mut key_buf);
+        let onward = || soft_pieces(&runs[run_idx + 1..], seen_fonts);
+
+        // A run border's box takes its width and space on each side of the
+        // bordered text (run-borders: a 1.5pt Emphasis box opens 1.5pt after
+        // the space before it and closes 1.5pt before the next glyph).
+        // A bordered word wrapping to a new line opens its box there again
+        // (run-borders p8: such lines start 1.5pt in).
+        let pad =
+            |b: Option<&crate::model::ParagraphBorder>| b.map_or(0.0, |b| b.width_pt + b.space_pt);
+        let line_start_pad = pad(run.border.as_ref());
+        if !text.is_empty() && run.border.as_ref() != prev_border {
+            current_x += pad(prev_border) + line_start_pad;
+            prev_border = run.border.as_ref();
+        }
+        // The box closes after the run's last word unless the next run
+        // continues it; a word ending the line needs that room too.
+        let closing_pad = if runs
+            .get(run_idx + 1)
+            .is_some_and(|r| r.border == run.border)
+        {
+            0.0
+        } else {
+            line_start_pad
+        };
+
+        let mut is_first_word_in_run = true;
+        let mut prev_char = None;
+        let mut words: std::collections::VecDeque<_> = split_preserving_spaces(text).into();
+        while let Some((space_count, mut source)) = words.pop_front() {
+            pending_space_count += space_count;
+            let literal_spaces = pending_space_count;
+            let prev_soft_tail = soft_tail.take();
+            let mut shown = shown_word(run, source);
+            let mut space_w =
+                space_count as f32 * word_space_width(run, entry, eff_fs, source, &mut prev_char);
+            // balanceSingleByteDoubleByteWidth: spaces beside an East Asian
+            // character are half an em each, including those carried over
+            // from the previous run's end.
+            if cjk.balance_sbdb
+                && (shown.starts_with(crate::docx::is_east_asian_char)
+                    || prev_last_char.is_some_and(crate::docx::is_east_asian_char))
+            {
+                if space_count > 0 {
+                    space_w = space_count as f32 * 0.5 * eff_fs;
+                } else if pending_space_w > 0.0 {
+                    pending_space_w = pending_space_count as f32 * 0.5 * eff_fs;
+                }
+            }
+            if space_count > 0 {
+                push_pending_space(
+                    &mut pending_spaces,
+                    &mut pending_space_w,
+                    run,
+                    entry,
+                    eff_fs,
+                    space_w,
+                );
+                pending_real_space = true;
+                last_space_run = Some(run);
+            }
+            let space_rtl = last_space_run.is_some_and(|r| r.rtl);
+            let space_underlined = last_space_run.is_some_and(underlines_space);
+            // current_chunks still holds what precedes this word on its line,
+            // so a wrap below keeps the space at the end of the finished line.
+            if std::mem::take(&mut pending_real_space) {
+                mark_space_after(&mut current_chunks);
+            }
+
+            // CJK auto-spacing (autoSpaceDE/DN): add ~0.25em gap at
+            // script boundaries between East Asian and Latin/digit text
+            // when there is no explicit whitespace.
+            if cjk.auto_space
+                && let Some(prev_ch) = prev_last_char
+                && let Some(first_ch) = shown.chars().next()
+                && pending_space_w == 0.0
+                && space_count == 0
+            {
+                // Only a letter or digit meets an ideograph: Word sets no gap
+                // after japanese_interlibrary's "〒" before "2", nor between
+                // chinese_costume's ")" and "格". An ideographic space is a
+                // space: japanese_medical's "　kg　" has no gap around "kg".
+                let ideograph =
+                    |c: char| crate::docx::is_east_asian_char(c) && !is_cjk_punctuation(c);
+                let latin = |c: char| c.is_alphanumeric() && !crate::docx::is_east_asian_char(c);
+                if (ideograph(prev_ch) && latin(first_ch))
+                    || (latin(prev_ch) && ideograph(first_ch))
+                {
+                    pending_spaces.clear();
+                    pending_space_w += eff_fs * 0.25;
+                }
+            }
+
+            // A word continues the previous word across a run boundary when
+            // there is no whitespace between runs, no leading spaces, and the
+            // two characters could not break inside one run either.
+            let nbsp_bridge = pending_space_w > 0.0
+                && (prev_last_char == Some('\u{00a0}') || shown.starts_with('\u{00a0}'));
+            let is_continuation = !current_chunks.is_empty()
+                && (nbsp_bridge
+                    || (is_first_word_in_run
+                        && space_count == 0
+                        && pending_space_w == 0.0
+                        && !current_chunks.is_empty()
+                        && !prev_last_char
+                            .zip(shown.chars().next())
+                            .is_some_and(|(a, b)| breaks_between(a, b))));
+            is_first_word_in_run = false;
+            // A word right after a soft hyphen on this line takes its hyphen
+            // back: Word measures it from where the hyphen starts.
+            let soft = prev_soft_tail.filter(|_| {
+                pending_space_w == 0.0
+                    && !is_continuation
+                    && current_chunks.last().is_some_and(|c| c.text.ends_with('-'))
+            });
+
+            let mut ww = width(&shown);
+            // A word wider than a whole line breaks at the margin, character
+            // by character (a 280-dot leader fills two lines).
+            let line_room = left_max(lines.len())
+                + if lines.is_empty() {
+                    first_line_hanging
+                } else {
+                    0.0
+                };
+            let room = line_room - current_x - pending_space_w;
+            let soft_room = room + soft.unwrap_or(0.0) + 0.05;
+            if ww > soft_room && !in_right_region && source.ends_with(SOFT_HYPHEN) {
+                let whole = (current_chunks.is_empty() || (is_continuation && word_start == 0))
+                    && right_region_for(lines.len()).is_none();
+                (source, shown, ww) =
+                    soft_continuation(run, source, &mut words, width, onward, soft_room, whole);
+            }
+            // A strip left of a wrapping float is no line: a word that fits
+            // the strip right of it moves there whole (Word puts "Extended"
+            // past a logo, not "Extend" before it).
+            let fits_right = right_region_for(lines.len()).is_some_and(|(_, rw, _)| ww <= rw);
+            // A word too wide for both strips beside a float leaves the line
+            // empty and goes on to the next; before any line, the paragraph
+            // itself starts lower (greensboro's 143 no-break spaces take four
+            // lines beside a logo, Word probe 2026-10-23).
+            if current_chunks.is_empty()
+                && !in_right_region
+                && !is_continuation
+                && ww > line_room
+                && !fits_right
+                && right_region_for(lines.len()).is_some()
+            {
+                if lines.is_empty() {
+                    skip.set(skip.get() + 1);
+                } else {
+                    lines.push(TextLine {
+                        float_skip: true,
+                        ..finish_dual_line(
+                            &mut current_chunks,
+                            &mut in_right_region,
+                            &mut cur_right_info,
+                        )
+                    });
+                }
+                pending_space_w = 0.0;
+                pending_space_count = 0;
+                words.push_front((0, source));
+                continue;
+            }
+            // Under wordWrap=0 a word that overruns the rest of the line breaks
+            // there too (torture_test: "…aufga" / "benübertragungsgesetz").
+            // Leading spaces before a word wider than the line keep a line of
+            // their own and the word breaks on the next (traditional_skills'
+            // " DD/MM/YY" cell; Word probes 2026-11-08): see below.
+            let spaces_wrap_first = pending_space_w > 0.0
+                && !in_right_region
+                && right_region_for(lines.len()).is_none();
+            let cut_here = if current_chunks.is_empty() {
+                ww > line_room && !spaces_wrap_first
+            } else {
+                cjk.break_words && ww > room
+            };
+            if cut_here && !in_right_region && !fits_right {
+                // Cut the letters as written, not the capitals drawn (ß → SS
+                // changes length), so each half keeps its own /ActualText.
+                if let Some(cut) = margin_cut(run, source, room, width) {
+                    words.push_front((0, &source[cut..]));
+                    source = &source[..cut];
+                    shown = shown_word(run, source);
+                    ww = width(&shown);
+                }
+            }
+            let mut word: &str = &shown;
+            let mut original = run.caps.then_some(source);
+            prev_last_char = word.chars().last();
+            soft_tail = provisional_hyphen(source, word, width);
+
+            // Japanese: a closing mark directly followed by another full-width
+            // mark keeps only its ink half, whether the line is tight or not
+            // (japanese_medical's "院）・専門" draws the ） 5.25pt wide in
+            // 10.5pt text on a line 13pt short of the measure: JIS X 4051's
+            // adjacent-mark squeeze).
+            let japanese = cjk.compress_punct && run_is_japanese(run);
+            if japanese {
+                ww -= ja_adjacent_marks(word) as f32 * 0.5 * eff_fs;
+            }
+            if japanese
+                && pending_space_w == 0.0
+                && word.chars().next().is_some_and(is_fullwidth_mark)
+                && let Some(last) = current_chunks.last_mut()
+                && last.punct_compressed == 0.0
+                && last.text.chars().last().is_some_and(is_compressible_punct)
+            {
+                let cut = last.font_size * 0.5;
+                last.squeeze_mark(cut);
+                current_x -= cut;
+            }
+
+            let need_space = !current_chunks.is_empty() && pending_space_w > 0.0;
+
+            let proposed_x = if need_space {
+                current_x + pending_space_w
+            } else if current_chunks.is_empty() && pending_space_w > 0.0 {
+                // Leading spaces at the start of a line act as a visual indent
+                pending_space_w
+            } else {
+                current_x - soft.unwrap_or(0.0)
+            };
+
+            let cur_max = cur_max_at(lines.len(), in_right_region, cur_right_info);
+
+            // Small tolerance for floating-point width accumulation over many glyphs
+            let word_closing_pad = if words.is_empty() { closing_pad } else { 0.0 };
+            let mut overflows = proposed_x + ww + word_closing_pad > cur_max + 0.05;
+            // The segment after a hyphen break may stay by narrowing the
+            // line's spaces, judged like a word after a space: Word 2013+ keeps
+            // "x", "12-", "based", "and/or" and "12345/2026" alike, within the
+            // same midpoint and budget (Word probe 2026-10-26).
+            let after_hyphen = current_chunks.last().is_some_and(|c| c.text.ends_with('-'));
+            // A word glued to the previous run's word is judged as one word.
+            let (word_x, word_w) = if is_continuation && word_start < current_chunks.len() {
+                let x = current_chunks[word_start].x_offset;
+                (x, proposed_x + ww - x)
+            } else {
+                (proposed_x, ww)
+            };
+            if overflows && (need_space || is_continuation || after_hyphen) && !in_right_region {
+                // How far the word may overflow and stay: Word 2013+ narrows
+                // the spaces, wpJustification the whole line.
+                let lead_space = if need_space {
+                    pending_space_w
+                } else if is_continuation && word_start > 0 {
+                    current_chunks.get(word_start).map_or(0.0, |first| {
+                        let before = &current_chunks[word_start - 1];
+                        if before.word_space_bridge {
+                            before.width
+                        } else {
+                            (first.x_offset - before.x_offset - before.width).max(0.0)
+                        }
+                    })
+                } else {
+                    0.0
+                };
+                let half_mark = if cjk.punct_half_out {
+                    word.chars()
+                        .last()
+                        .filter(|c| ".,;:!?".contains(*c))
+                        .map_or(0.0, |c| entry.char_width_1000(c) * eff_fs / 2000.0)
+                } else {
+                    0.0
+                };
+                let spaces = line_space_width(&current_chunks) + pending_space_w;
+                let keeps = squeeze_keeps(
+                    word_x + word_w - cur_max - half_mark,
+                    word_w,
+                    lead_space,
+                    spaces,
+                );
+                let space_room = (cjk.squeeze_spaces && keeps).then(|| SPACE_SQUEEZE * spaces);
+                let line_room = (cjk.squeeze_line && (need_space || is_continuation))
+                    .then(|| SQUEEZE_LINE_SPACES * entry.space_width(eff_fs));
+                if [space_room, line_room]
+                    .into_iter()
+                    .flatten()
+                    .any(|room| proposed_x + ww + word_closing_pad - cur_max <= room)
+                {
+                    overflows = false;
+                    squeezed_lines.push(lines.len());
+                }
+            }
+
+            // compressPunctuation: before wrapping, make room for this word by
+            // squeezing the full-width punctuation already on the line (and,
+            // under the 2010 layout, the word's own closing mark, whose cut
+            // comes off its chunk once pushed).
+            let (proposed_x, overflows, own_mark_cut) = if overflows
+                && cjk.compress_punct
+                && cjk.punct_pull
+                && !current_chunks.is_empty()
+                && !in_right_region
+                && right_region_for(lines.len()).is_none()
+                && cur_max - current_x >= cjk.punct_pull_free_ratio * cur_max
+                // Word compares in whole twips, so exactly half an em free
+                // pulls (chinese_costume_design_course: 4.5pt free at 9pt).
+                && super::helpers::twips(cur_max - proposed_x)
+                    >= super::helpers::twips(cjk.punct_pull_free_em * eff_fs)
+                && let Some(cut) = compress_punctuation(
+                    &mut current_chunks,
+                    proposed_x + ww - cur_max,
+                    (cjk.punct_cut_last && word.ends_with(is_compressible_punct))
+                        .then_some(eff_fs),
+                )
+            {
+                current_x = current_chunks.last().map_or(0.0, |c| c.x_offset + c.width);
+                (
+                    if need_space {
+                        current_x + pending_space_w
+                    } else {
+                        current_x
+                    },
+                    false,
+                    cut,
+                )
+            } else {
+                (proposed_x, overflows, 0.0)
+            };
+
+            // When leading spaces push the first word past the line width,
+            // emit a blank line for the spaces and start the word at x=0.
+            // Word absorbs the spaces onto the current line and wraps the
+            // word to the next line. (Skipped when a right region exists —
+            // the spill below carries the space indent past the float.)
+            if current_chunks.is_empty()
+                && overflows
+                && pending_space_w > 0.0
+                && !in_right_region
+                && right_region_for(lines.len()).is_none()
+            {
+                lines.push(finish_dual_line(
+                    &mut current_chunks,
+                    &mut in_right_region,
+                    &mut cur_right_info,
+                ));
+                pending_space_w = 0.0;
+                pending_space_count = 0;
+                word_start = 0;
+                if ww > left_max(lines.len()) {
+                    words.push_front((0, source));
+                    continue;
+                }
+                push_word_chunks(
+                    &mut current_chunks,
+                    &wr,
+                    word,
+                    original,
+                    line_start_pad,
+                    ww,
+                    space_rtl,
+                    cjk.compress_punct,
+                );
+                current_x = line_start_pad + ww;
+                continue;
+            }
+
+            // A word split over several runs wraps as a whole: carry the part
+            // already placed to the next line. One wider than that line breaks
+            // at its margin, character by character, like a single-run word.
+            if is_continuation
+                && overflows
+                && word_start < current_chunks.len()
+                && !in_right_region
+                && right_region_for(lines.len()).is_none()
+            {
+                let dx = current_chunks[word_start].x_offset;
+                // Under wordWrap=0 the part already placed stays, and the rest
+                // breaks at the line end like a single-run word.
+                if word_start > 0 && !cjk.break_words {
+                    let carried: Vec<WordChunk> = current_chunks.drain(word_start..).collect();
+                    lines.push(finish_dual_line(
+                        &mut current_chunks,
+                        &mut in_right_region,
+                        &mut cur_right_info,
+                    ));
+                    current_chunks.extend(carried.into_iter().map(|mut c| {
+                        c.x_offset -= dx;
+                        c
+                    }));
+                    current_x -= dx;
+                    word_start = 0;
+                }
+                if pending_space_w > 0.0 {
+                    current_chunks.extend(space_underline(
+                        last_space_run,
+                        entry,
+                        eff_fs,
+                        current_x,
+                        pending_space_w,
+                    ));
+                }
+                current_x += pending_space_w;
+                pending_space_w = 0.0;
+                pending_space_count = 0;
+                let room = left_max(lines.len()) - current_x;
+                if ww > room + 0.05 {
+                    let cut = margin_cut(run, source, room, width)
+                        .filter(|&c| width(&shown_word(run, &source[..c])) <= room + 0.05);
+                    if let Some(cut) = cut {
+                        words.push_front((0, &source[cut..]));
+                        source = &source[..cut];
+                        shown = shown_word(run, source);
+                        word = &shown;
+                        original = run.caps.then_some(source);
+                        ww = width(word);
+                        prev_last_char = word.chars().last();
+                        soft_tail = None;
+                    } else {
+                        // Not one more character fits: the rest goes on as the
+                        // next word and wraps there.
+                        words.push_front((0, source));
+                        continue;
+                    }
+                }
+                let chunk_start = current_chunks.len();
+                push_word_chunks(
+                    &mut current_chunks,
+                    &wr,
+                    word,
+                    original,
+                    current_x,
+                    ww,
+                    space_rtl,
+                    cjk.compress_punct,
+                );
+                if literal_spaces > 1 && !space_underlined && chunk_start > 0 {
+                    current_chunks[chunk_start].preceding_spaces = literal_spaces;
+                }
+                current_x += ww;
+                continue;
+            }
+
+            // For the first word on a line, also overflow if the
+            // left region is zero-width (so words go straight to
+            // the right region for e.g. left-aligned images).
+            let first_word_overflow = current_chunks.is_empty()
+                && !in_right_region
+                && (cur_max <= 0.0 || overflows)
+                && right_region_for(lines.len()).is_some();
+
+            if (!current_chunks.is_empty() && overflows && !is_continuation) || first_word_overflow
+            {
+                // Word doesn't fit in current region
+                if !in_right_region {
+                    // Try spilling to the right region on the same line; a
+                    // word too wide for it starts the next line instead (Word
+                    // example: "november" beside a 40pt strip right of a box).
+                    if let Some((rx, rw, _)) = right_region_for(lines.len())
+                        .filter(|&(_, rw, _)| current_chunks.is_empty() || ww <= rw + 0.05)
+                    {
+                        cur_right_info = Some((current_chunks.len(), rx, rw));
+                        in_right_region = true;
+                        // Leading spaces on a line that starts in the right
+                        // region indent the first word (Word keeps them).
+                        let start_x = if current_chunks.is_empty()
+                            && pending_space_w > 0.0
+                            && pending_space_w + ww <= rw
+                        {
+                            pending_space_w
+                        } else {
+                            0.0
+                        };
+                        pending_space_w = 0.0;
+                        pending_space_count = 0;
+                        word_start = current_chunks.len();
+                        push_word_chunks(
+                            &mut current_chunks,
+                            &wr,
+                            word,
+                            original,
+                            start_x,
+                            ww,
+                            space_rtl,
+                            cjk.compress_punct,
+                        );
+                        current_x = start_x + ww;
+                        continue;
+                    }
+                }
+                // Try hyphenation before wrapping whole word
+                // No right region or right region also full — wrap to next line
+                let mut line = TextLine {
+                    trailing_space: pending_space_w,
+                    trailing_space_rtl: space_rtl,
+                    ..finish_dual_line(
+                        &mut current_chunks,
+                        &mut in_right_region,
+                        &mut cur_right_info,
+                    )
+                };
+                underline_line_end(&mut line, cjk, &pending_spaces, current_x, pending_space_w);
+                lines.push(line);
+                current_x = line_start_pad;
+                // A word too wide for a strip beside a float goes below it
+                // whole (Word example: "charlie" beside a 40pt strip right of a
+                // wrapText=right picture).
+                if let Some(widths) = per_line_widths.filter(|_| per_line_dual.is_none()) {
+                    let widest = widths.iter().copied().fold(max_width, f32::max);
+                    while ww <= widest
+                        && lines.len() + skip.get() < widths.len()
+                        && ww > left_max(lines.len())
+                        && left_max(lines.len()) < widest - 0.05
+                    {
+                        lines.push(TextLine {
+                            float_skip: true,
+                            ..TextLine::default()
+                        });
+                    }
+                }
+                // A word wider than the new line breaks at its margin too.
+                let room = left_max(lines.len());
+                let right = right_region_for(lines.len());
+                if ww > room && right.is_none() && source.ends_with(SOFT_HYPHEN) {
+                    (source, shown, ww) = soft_continuation(
+                        run,
+                        source,
+                        &mut words,
+                        width,
+                        onward,
+                        room + 0.05,
+                        true,
+                    );
+                    word = &shown;
+                    original = run.caps.then_some(source);
+                    prev_last_char = word.chars().last();
+                    soft_tail = provisional_hyphen(source, word, width);
+                }
+                if ww > room
+                    && right.is_none()
+                    && let Some(cut) = margin_cut(run, source, room, width)
+                {
+                    words.push_front((0, &source[cut..]));
+                    source = &source[..cut];
+                    shown = shown_word(run, source);
+                    word = &shown;
+                    original = run.caps.then_some(source);
+                    ww = width(word);
+                    prev_last_char = word.chars().last();
+                    soft_tail = None;
+                }
+                // If the new line's left region is zero-width, go
+                // straight to the right region for this word.
+                if let Some((rx, rw, _)) = right {
+                    // So does a word the left region is too narrow for: Word
+                    // leaves that gap empty rather than split the word around
+                    // the float (case42's "ullamcorper." beside the arm).
+                    // One too wide for the right region as well leaves the whole
+                    // line empty and tries the next one, down to the first line
+                    // clear of the float, where it breaks at the margin
+                    // (greensboro's 143 no-break spaces take 4 lines, Word probe
+                    // 2026-10-23).
+                    if (room <= 0.0 || ww > room) && ww > rw + 0.05 {
+                        lines.push(TextLine {
+                            float_skip: true,
+                            ..finish_dual_line(
+                                &mut current_chunks,
+                                &mut in_right_region,
+                                &mut cur_right_info,
+                            )
+                        });
+                        words.push_front((0, source));
+                        continue;
+                    }
+                    if room <= 0.0 || ww > room {
+                        cur_right_info = Some((0, rx, rw));
+                        in_right_region = true;
+                        pending_space_w = 0.0;
+                        pending_space_count = 0;
+                        word_start = 0;
+                        push_word_chunks(
+                            &mut current_chunks,
+                            &wr,
+                            word,
+                            original,
+                            0.0,
+                            ww,
+                            space_rtl,
+                            cjk.compress_punct,
+                        );
+                        current_x = ww;
+                        continue;
+                    }
+                }
+            } else {
+                drop_soft_hyphen(&mut current_chunks, soft);
+                current_x = proposed_x;
+            }
+            // Bridge the underline across the space preceding this word when the
+            // space's own run is underlined, so a continuously-underlined run
+            // renders as one unbroken line rather than per-word segments.
+            if !current_chunks.is_empty() && pending_space_w > 0.0 {
+                current_chunks.extend(space_underline(
+                    last_space_run,
+                    entry,
+                    eff_fs,
+                    current_x - pending_space_w,
+                    pending_space_w,
+                ));
+            }
+            pending_space_w = 0.0;
+            pending_space_count = 0;
+
+            if !is_continuation {
+                word_start = current_chunks.len();
+            }
+            let chunk_start = current_chunks.len();
+            push_word_chunks(
+                &mut current_chunks,
+                &wr,
+                word,
+                original,
+                current_x,
+                ww,
+                space_rtl,
+                cjk.compress_punct,
+            );
+            if literal_spaces > 1
+                && !space_underlined
+                && chunk_start > 0
+                && let Some(c) = current_chunks.get_mut(chunk_start)
+            {
+                c.preceding_spaces = literal_spaces;
+            }
+            if own_mark_cut > 0.0
+                && let Some(last) = current_chunks.last_mut()
+            {
+                last.squeeze_mark(own_mark_cut);
+            }
+            current_x += ww - own_mark_cut;
+        }
+
+        // Accumulate trailing whitespace for the next run
+        let trailing_spaces = text
+            .chars()
+            .rev()
+            .take_while(|c| is_break_space(*c))
+            .count();
+        if trailing_spaces > 0 {
+            pending_space_count += trailing_spaces;
+            let space_w =
+                trailing_spaces as f32 * word_space_width(run, entry, eff_fs, "", &mut prev_char);
+            push_pending_space(
+                &mut pending_spaces,
+                &mut pending_space_w,
+                run,
+                entry,
+                eff_fs,
+                space_w,
+            );
+            pending_real_space = true;
+            last_space_run = Some(run);
+        }
+    }
+
+    drop_soft_hyphen(&mut current_chunks, soft_tail);
+    let ends_in_text = !current_chunks.is_empty();
+    if ends_in_text {
+        lines.push(finish_dual_line(
+            &mut current_chunks,
+            &mut in_right_region,
+            &mut cur_right_info,
+        ));
+    }
+
+    push_trailing_break_line(&mut lines, runs);
+
+    if lines.is_empty() {
+        lines.push(TextLine::default());
+    }
+    if let Some(line) = lines
+        .last_mut()
+        .filter(|l| ends_in_text || l.chunks.is_empty())
+    {
+        underline_line_end(line, cjk, &pending_spaces, current_x, pending_space_w);
+    }
+    // A display equation broken over lines is aligned as a group: each line
+    // as wide as the widest, so centring puts every line's start (the
+    // continuation lines' indent included) on one edge: Word starts a
+    // full-width first line 1.7pt in, the rest 72pt further (`mp18_after`).
+    if display_wrapped {
+        let display = |l: &TextLine| {
+            l.chunks
+                .iter()
+                .any(|c| c.math.as_ref().is_some_and(|m| m.display))
+        };
+        let group_w = lines
+            .iter()
+            .filter(|l| display(l))
+            .fold(0.0f32, |w, l| w.max(l.total_width));
+        for line in lines.iter_mut().filter(|l| display(l)) {
+            line.total_width = group_w;
+        }
+    }
+    for i in squeezed_lines {
+        if let Some(line) = lines.get_mut(i) {
+            line.squeezed = true;
+            line.squeeze_chars = cjk.squeeze_line;
+        }
+    }
+    if skip.get() > 0 {
+        let mut skipped: Vec<TextLine> = (0..skip.get())
+            .map(|_| TextLine {
+                float_skip: true,
+                ..TextLine::default()
+            })
+            .collect();
+        skipped.append(&mut lines);
+        lines = skipped;
+    }
+    let starts: Option<Vec<f32>> = (!cjk.bidi && lines.iter().any(|l| !l.end_spaces.is_empty()))
+        .then(|| lines.iter().map(|l| l.total_width).collect());
+    super::bidi::reorder_lines(&mut lines, cjk.bidi, seen_fonts);
+    for (line, start) in lines.iter_mut().zip(starts.into_iter().flatten()) {
+        if !line.draw_order.is_empty() {
+            for sp in &mut line.end_spaces {
+                sp.x_offset = line.total_width + (sp.x_offset - start);
+            }
+        }
+    }
+    finish_lines(&mut lines, &cjk);
+    lines
+}
+
+/// A trailing line break creates an empty line after it (Word adds a blank
+/// line for each w:br at the end of a paragraph).  Store the break run's
+/// font size so the caller can compute the correct height for this line.
+fn push_trailing_break_line(lines: &mut Vec<TextLine>, runs: &[Run]) {
+    if lines.last().is_some_and(|l| l.ends_with_break) {
+        let break_fs = runs
+            .iter()
+            .rev()
+            .find(|r| r.is_line_break)
+            .map(|r| r.font_size);
+        lines.push(TextLine {
+            break_font_size: break_fs,
+            ..TextLine::default()
+        });
+    }
+}
+
+/// The paragraph-wide flags every line carries (see `TextLine`).
+fn finish_lines(lines: &mut [TextLine], cjk: &CjkLayout) {
+    for line in lines.iter_mut() {
+        line.rtl_paragraph = cjk.bidi;
+        line.shaped_kerning = cjk.shaped_kerning;
+        if !cjk.expand_shift_return && line.ends_with_break {
+            line.natural_width = true;
+        }
+    }
+}
+
+fn find_next_tab_stop(
+    current_x: f32,
+    tab_stops: &[TabStop],
+    indent_left: f32,
+    default_tab_interval: f32,
+) -> (TabStop, bool) {
+    let abs_x = current_x + indent_left;
+    if let Some(s) = tab_stops.iter().find(|s| s.position > abs_x + 0.5) {
+        return (s.clone(), true);
+    }
+    let interval = if default_tab_interval > 0.0 {
+        default_tab_interval
+    } else {
+        DEFAULT_TAB_INTERVAL
+    };
+    let next = ((abs_x / interval).floor() + 1.0) * interval;
+    let default = TabStop {
+        position: next,
+        alignment: TabAlignment::Left,
+        leader: None,
+    };
+    (default, false)
+}
+
+/// The width of the whitespace a tab segment opens with, before its first
+/// word (`segment_width` leaves it out).
+fn leading_space_width(runs: &[&Run], seen_fonts: &HashMap<String, FontEntry>) -> f32 {
+    let mut w = 0.0;
+    let mut key_buf = String::new();
+    for run in runs {
+        let key = font_key_buf(run, &mut key_buf);
+        let entry = seen_fonts.get(key).expect("font registered");
+        let eff_fs = effective_font_size(run, entry);
+        let text = caps_word(run, &run.text);
+        let spaces = text.chars().take_while(|c| c.is_whitespace()).count();
+        let mut prev_char = None;
+        w += spaces as f32 * word_space_width(run, entry, eff_fs, " ", &mut prev_char);
+        if spaces < text.chars().count() {
+            break;
+        }
+    }
+    w
+}
+
+fn segment_width(runs: &[&Run], seen_fonts: &HashMap<String, FontEntry>) -> f32 {
+    let mut w: f32 = 0.0;
+    let mut first = true;
+    // Whitespace since the last word, across run boundaries: every space
+    // counts ("Office:  317-477-4380" after a right tab has two), and runs
+    // that meet without one join their words.
+    let mut spaces = 0usize;
+    let mut key_buf = String::new();
+    for run in runs {
+        if run.is_line_break {
+            break;
+        }
+        if let Some(img) = &run.inline_image {
+            // A picture is part of the aligned segment (issue #147: a centred
+            // tab put a 123pt picture's left edge, not its middle, on the stop).
+            w += img.layout_size().0;
+            first = false;
+            spaces = 0;
+            continue;
+        }
+        let key = font_key_buf(run, &mut key_buf);
+        let entry = seen_fonts.get(key).expect("font registered");
+        let eff_fs = effective_font_size(run, entry);
+        let width = |w: &str| word_width_for_run(entry, run, w, eff_fs);
+        let text = caps_word(run, &run.text);
+        let mut prev_char = None;
+        for piece in text.split(char::is_whitespace) {
+            if piece.is_empty() {
+                spaces += 1;
+                continue;
+            }
+            let space_w = word_space_width(run, entry, eff_fs, piece, &mut prev_char);
+            if !first {
+                w += space_w * spaces as f32;
+            }
+            w += soft_split_width(piece, width);
+            first = false;
+            spaces = 1;
+        }
+        // The last piece is followed by no separator of its own.
+        spaces -= 1;
+    }
+    w
+}
+
+/// The text a tab takes along when it wraps: the segment's words up to its
+/// first space. Word never breaks between a tab and the word after it, but
+/// does at a soft hyphen there, which then shows: the least the line must
+/// hold is the word up to a soft hyphen and its hyphen ("Diagram-" stays after
+/// the tab on a line too short for "Diagrammatically"), or the whole word
+/// where that is narrower ("x<tab>Veri" stays on a line too short for
+/// "x<tab>Ver-").
+fn first_word_width(runs: &[&Run], seen_fonts: &HashMap<String, FontEntry>) -> f32 {
+    let (mut w, mut least) = (0.0, f32::INFINITY);
+    let mut key_buf = String::new();
+    let mut prev: Option<char> = None;
+    'runs: for run in runs {
+        if run.is_line_break || run.inline_image.is_some() {
+            break;
+        }
+        let width = run_width(run, seen_fonts, &mut key_buf);
+        for (spaces, piece) in split_preserving_spaces(&run.text) {
+            // East Asian text breaks without a space: Word keeps
+            // "[1]<tab>桥梁…" on a line too short for the whole clause.
+            let east_asian_break = prev.zip(piece.chars().next()).is_some_and(|(a, b)| {
+                breaks_between(a, b)
+                    && (crate::docx::is_east_asian_char(a) || crate::docx::is_east_asian_char(b))
+            });
+            if spaces > 0 || east_asian_break {
+                break 'runs;
+            }
+            prev = piece.chars().last();
+            let (pw, hyphen) = soft_piece(run, piece, width);
+            if let Some(h) = hyphen {
+                least = least.min(w + pw + h);
+            }
+            w += pw;
+        }
+        if run.text.ends_with(is_break_space) {
+            break;
+        }
+    }
+    least.min(w)
+}
+
+fn decimal_before_width(runs: &[&Run], seen_fonts: &HashMap<String, FontEntry>) -> f32 {
+    let texts: Vec<Cow<'_, str>> = runs.iter().map(|r| caps_word(r, &r.text)).collect();
+    let full_text: String = texts.iter().map(|t| t.as_ref()).collect();
+    let before = if let Some(dot_pos) = full_text.find('.') {
+        &full_text[..dot_pos]
+    } else {
+        &full_text
+    };
+    let mut w: f32 = 0.0;
+    let mut chars_remaining = before.len();
+    let mut key_buf = String::new();
+    for (run, text) in runs.iter().zip(texts.iter()) {
+        let key = font_key_buf(run, &mut key_buf);
+        let entry = seen_fonts.get(key).expect("font registered");
+        let eff_fs = effective_font_size(run, entry);
+        let text_to_measure = if text.len() <= chars_remaining {
+            chars_remaining -= text.len();
+            text.as_ref()
+        } else {
+            let s = &text[..chars_remaining];
+            chars_remaining = 0;
+            s
+        };
+        w += soft_split_width(text_to_measure, |p| spaced_width(entry, run, p, eff_fs));
+        if chars_remaining == 0 {
+            break;
+        }
+    }
+    w
+}
+
+/// Ends a tabbed line at a wrap; `tabs` sizes it if only tabs are on it.
+fn wrap_tabbed_line(
+    result_lines: &mut Vec<TextLine>,
+    chunks: &mut Vec<WordChunk>,
+    justify_from: &mut usize,
+    tabs: Option<(f32, Option<f32>)>,
+) {
+    let mut line = TextLine {
+        justify_from: std::mem::take(justify_from),
+        ..finish_line(chunks)
+    };
+    line.hold_tabs(tabs);
+    result_lines.push(line);
+}
+
+/// Build TextLines for a paragraph that contains tab characters.
+/// Wraps to new lines when content exceeds `max_width`.
+pub(super) fn build_tabbed_line(
+    runs: &[Run],
+    seen_fonts: &HashMap<String, FontEntry>,
+    tab_stops: &[TabStop],
+    indent_left: f32,
+    max_width: f32,
+    indent_right: f32,
+    first_line_hanging: f32,
+    inline_image_names: &HashMap<usize, String>,
+    effect_inline_names: &HashMap<usize, super::images::EffectXObjs>,
+    default_tab_stop: f32,
+    tab_exclusions: &[(f32, f32)],
+    compat_mode: u32,
+    cjk: CjkLayout,
+) -> Vec<TextLine> {
+    let runs = &*prepare_runs(runs, seen_fonts, max_width);
+    // Split runs into segments at tab markers, tracking original run indices.
+    // The fourth tuple element is the `<w:tab/>` run itself (when present) so the
+    // segment can see its underline/color formatting and render a decoration line
+    // across the tab gap — the Word pattern for underlined signature/HR lines.
+    let mut segments: Vec<(Vec<&Run>, Vec<usize>, Option<&Run>)> = Vec::new();
+    let mut current_seg: Vec<&Run> = Vec::new();
+    let mut current_indices: Vec<usize> = Vec::new();
+    let mut pending_tab_run: Option<&Run> = None;
+
+    for (global_idx, run) in runs.iter().enumerate() {
+        if run.vanish {
+            continue;
+        }
+        if run.is_tab {
+            segments.push((
+                std::mem::take(&mut current_seg),
+                std::mem::take(&mut current_indices),
+                pending_tab_run.take(),
+            ));
+            pending_tab_run = Some(run);
+        } else {
+            current_seg.push(run);
+            current_indices.push(global_idx);
+        }
+    }
+    segments.push((
+        std::mem::take(&mut current_seg),
+        std::mem::take(&mut current_indices),
+        pending_tab_run.take(),
+    ));
+
+    let mut result_lines: Vec<TextLine> = Vec::new();
+    let mut squeezed_lines: Vec<usize> = Vec::new();
+    let mut justify_from = 0usize;
+    let mut all_chunks: Vec<WordChunk> = Vec::new();
+    let mut current_x: f32 = 0.0;
+    let mut pending_space_w: f32 = 0.0;
+    let mut pending_spaces: Vec<PendingSpaceRun> = Vec::new();
+    let mut key_buf = String::new();
+    let mut is_first_line = true;
+    // Set when tabs wrap onto a new line that has nothing drawn yet.
+    let mut tab_wrapped_line = false;
+    // How far this line's words may run past its end: to a right, centre or
+    // decimal stop in the right indent (western_australia's "34(1), 48(3)"),
+    // or anywhere after an explicit stop past the margin before compat 15.
+    let mut line_reach = 0.0f32;
+
+    let mut tab_line_metrics: Option<(f32, Option<f32>)> = None;
+    // The width of the hyphen a soft hyphen showed at the end of the word
+    // placed last (`shown_word`).
+    let mut soft_tail: Option<f32> = None;
+    // The last character of the text placed last; None after a tab, picture
+    // or formula, whose following word stays glued to it.
+    let mut prev_last_char: Option<char> = None;
+    // Where the word the next glued run would continue starts in `all_chunks`.
+    let mut glued_from: Option<usize> = None;
+    let line_max_at = |first: bool| {
+        if first {
+            max_width + first_line_hanging
+        } else {
+            max_width
+        }
+    };
+    for (seg_idx, (seg_runs, seg_indices, tab_run_before)) in segments.iter().enumerate() {
+        let line_max = line_max_at(is_first_line);
+        let line_indent = if is_first_line {
+            indent_left - first_line_hanging
+        } else {
+            indent_left
+        };
+
+        // Track the tab stop position so we can ensure current_x advances past it
+        let mut tab_stop_pos: Option<f32> = None;
+
+        if seg_idx > 0 {
+            // A tab is pure positioning here, but extraction must still see
+            // the word boundary (Word's text reads "(2) If", not "(2)If").
+            mark_space_after(&mut all_chunks);
+            prev_last_char = None;
+            // A soft hyphen before the tab shows only if the tab wraps.
+            let mut soft = soft_tail.take();
+            current_x -= soft.unwrap_or(0.0);
+            // Trailing-space handling before a tab depends on whether an
+            // explicit tab stop applies:
+            // - An explicit stop AFTER current_x consumes the trailing spaces
+            //   (header/footer center+right pattern — the tab must snap to that
+            //   stop regardless of how wide the preceding whitespace is).
+            // - Otherwise we fall through to default tab stops; trailing spaces
+            //   advance the cursor so the tab can snap past them. This matters
+            //   for list paragraphs with long dot-leader trailing-space runs.
+            let abs_x_no_spaces = current_x + line_indent;
+            let has_explicit_after = tab_stops.iter().any(|s| s.position > abs_x_no_spaces + 0.5);
+            let text_end = current_x;
+            if !has_explicit_after {
+                current_x += pending_space_w;
+            }
+            // A positional tab (w:ptab) resolves against the margin box with its own
+            // alignment, bypassing the paragraph's tab stops. Left→box left, Center→box
+            // center, Right→box right edge. This is what produces Word's left/center/right
+            // footer layout that ordinary tab stops can't express here.
+            let ptab_align = tab_run_before.and_then(|r| r.ptab_alignment);
+            let (stop, mut effective_tab_target, explicit) = if let Some(palign) = ptab_align {
+                let target = match palign {
+                    TabAlignment::Center => max_width / 2.0,
+                    TabAlignment::Right => max_width,
+                    _ => 0.0,
+                };
+                (
+                    TabStop {
+                        position: target + line_indent,
+                        alignment: palign,
+                        leader: None,
+                    },
+                    target,
+                    false,
+                )
+            } else {
+                let (mut s, mut explicit) =
+                    find_next_tab_stop(current_x, tab_stops, line_indent, default_tab_stop);
+                // Word advances a left tab past any floating image whose body
+                // occludes the stop, snapping to the first stop clear of the
+                // image's right edge. `tab_exclusions` are (left, right) spans
+                // in the same from-text-margin space as `s.position`.
+                loop {
+                    let bumped = tab_exclusions
+                        .iter()
+                        .find(|&&(ex_l, ex_r)| s.position > ex_l + 0.5 && s.position < ex_r - 0.5);
+                    match bumped {
+                        Some(&(_, ex_r)) => {
+                            (s, explicit) = find_next_tab_stop(
+                                ex_r - line_indent,
+                                tab_stops,
+                                line_indent,
+                                default_tab_stop,
+                            );
+                        }
+                        None => break,
+                    }
+                }
+                let t = s.position - line_indent;
+                (s, t, explicit)
+            };
+            let mut seg_start = resolve_tab_aligned_start(
+                &stop,
+                effective_tab_target,
+                seg_runs,
+                seen_fonts,
+                current_x,
+            );
+            let mut resolved_leader = stop.leader;
+
+            // Explicit tab stops may legitimately target positions beyond the
+            // paragraph's right indent — TOC entries are a common case where a
+            // right-aligned page-number tab sits near the content edge. Allow
+            // segments to extend up to the physical content edge (indent_right
+            // beyond max_width) before forcing a wrap.
+            let wrap_limit = line_max + indent_right;
+            // Word probes on an explicit stop past the margin: before Word
+            // 2013 layout it keeps the tab and all that follows on this line,
+            // off the page if need be (polish_building's 1216pt stop); from
+            // 2013 on a right, centre or decimal stop clamps to the margin
+            // (carbon_farming's TOC page numbers) and a left one wraps.
+            // Otherwise a tab wraps when it lands past the margin or the word
+            // after it doesn't fit (a default stop on the margin stays:
+            // massachusetts' signature line keeps its fifth tab there).
+            let stop_past = effective_tab_target > wrap_limit;
+            if explicit && stop_past && compat_mode < 15 {
+                line_reach = f32::INFINITY;
+            } else if explicit && stop_past && stop.alignment != TabAlignment::Left {
+                effective_tab_target = wrap_limit;
+                seg_start =
+                    resolve_tab_aligned_start(&stop, wrap_limit, seg_runs, seen_fonts, current_x);
+            } else if (seg_start > wrap_limit
+                || (stop.alignment == TabAlignment::Left
+                    && seg_start + first_word_width(seg_runs, seen_fonts) > line_max))
+                // A line of nothing but tabs wraps too (chiseldon's 27 default
+                // tabs take two lines in Word); one tab on an empty line stays.
+                && (!all_chunks.is_empty() || current_x > 0.0)
+            {
+                // The overflowing tab moves with its following word.
+                wrap_tabbed_line(
+                    &mut result_lines,
+                    &mut all_chunks,
+                    &mut justify_from,
+                    tab_line_metrics.take(),
+                );
+                if let Some(line) = result_lines.last_mut() {
+                    underline_line_end(line, cjk, &pending_spaces, text_end, pending_space_w);
+                }
+                soft = None;
+                tab_wrapped_line = true;
+                line_reach = 0.0;
+                current_x = 0.0;
+                is_first_line = false;
+                let (new_stop, _) =
+                    find_next_tab_stop(0.0, tab_stops, indent_left, default_tab_stop);
+                let new_target = new_stop.position - indent_left;
+                seg_start =
+                    resolve_tab_aligned_start(&new_stop, new_target, seg_runs, seen_fonts, 0.0);
+                resolved_leader = new_stop.leader;
+                effective_tab_target = new_target;
+            }
+            drop_soft_hyphen(&mut all_chunks, soft);
+            pending_space_w = 0.0;
+            if stop.alignment != TabAlignment::Left {
+                line_reach = line_reach.max(effective_tab_target);
+            }
+            if let Some(tab_run) = tab_run_before {
+                let entry = seen_fonts
+                    .get(font_key_buf(tab_run, &mut key_buf))
+                    .expect("font registered");
+                let fs = effective_font_size(tab_run, entry);
+                let lhr = entry.line_h_ratio;
+                if tab_line_metrics.is_none_or(|(old_fs, old_lhr)| {
+                    fs * lhr.unwrap_or(1.2) > old_fs * old_lhr.unwrap_or(1.2)
+                }) {
+                    tab_line_metrics = Some((fs, lhr));
+                }
+            }
+
+            // Draw leader fill between end of previous text and start of aligned text
+            let leader = resolved_leader;
+
+            // Tab runs with `<w:u>` render the tab gap as an underlined line
+            // (Word pattern for signature/HR lines). Emit a decoration-only
+            // chunk so the underline decoration pass picks it up.
+            if let Some(tab_run) = tab_run_before
+                && tab_run.underline
+                && seg_start > current_x + 0.01
+            {
+                // A tab alone on its line, only tabs and spaces up to
+                // its break or mark, underlines at its own size, not
+                // the break's or a space run's.
+                let alone = all_chunks.iter().all(|c| c.text.trim().is_empty())
+                    && segments[seg_idx..]
+                        .iter()
+                        .flat_map(|(runs, ..)| runs)
+                        .take_while(|r| !r.is_line_break)
+                        .all(|r| {
+                            r.text.trim().is_empty()
+                                && r.inline_image.is_none()
+                                && r.math.is_none()
+                                && r.checkbox.is_none()
+                        });
+                let font_run: &Run = if alone {
+                    tab_run
+                } else {
+                    seg_runs
+                        .first()
+                        .copied()
+                        .or_else(|| runs.iter().find(|r| !r.font_name.is_empty()))
+                        .unwrap_or(tab_run)
+                };
+                let key = font_key_buf(font_run, &mut key_buf);
+                let entry = seen_fonts.get(key).expect("font registered");
+                let eff_fs = effective_font_size(tab_run, entry).max(font_run.font_size);
+                all_chunks.push(WordChunk::tab_underline(
+                    entry,
+                    eff_fs,
+                    tab_run.underline_color.or(tab_run.color),
+                    tab_run.underline_style,
+                    tab_run.border.clone(),
+                    current_x,
+                    seg_start - current_x,
+                ));
+            }
+
+            if let Some(leader_char) = leader {
+                // The leader takes the tab character's own font, size and
+                // colour (example: a 20pt tab between 10pt words draws 20pt dots).
+                let font_run: Option<&Run> = tab_run_before
+                    .filter(|r| !r.font_name.is_empty())
+                    .or_else(|| seg_runs.first().copied())
+                    .or_else(|| {
+                        segments[..seg_idx]
+                            .iter()
+                            .rev()
+                            .flat_map(|(r, _, _)| r.last().copied())
+                            .next()
+                    })
+                    .or_else(|| {
+                        // Tab-only paragraphs: fall back to any run (including tab runs)
+                        runs.iter().find(|r| !r.font_name.is_empty())
+                    });
+                if let Some(run) = font_run {
+                    let key = font_key_buf(run, &mut key_buf);
+                    let entry = seen_fonts.get(key).expect("font registered");
+                    let eff_fs = effective_font_size(run, entry);
+                    let char_w = entry.char_width_1000(leader_char) * eff_fs / 1000.0;
+                    let leader_gap = seg_start - current_x;
+                    if char_w > 0.0 && leader_gap > 0.0 {
+                        // Drawing places the glyphs on the page (see
+                        // `WordChunk::leader`); the text is a stand-in.
+                        all_chunks.push(WordChunk::leader(
+                            entry,
+                            leader_char,
+                            super::glyph_grid::leader_positions(
+                                char_w,
+                                (current_x * 4.0).round() as i64,
+                                (seg_start * 4.0).round() as i64,
+                            )
+                            .len()
+                            .max(1),
+                            eff_fs,
+                            run.color,
+                            current_x,
+                            leader_gap,
+                        ));
+                    }
+                }
+            }
+
+            current_x = seg_start;
+            tab_stop_pos = Some(effective_tab_target);
+            justify_from = all_chunks.len();
+        }
+
+        // Layout text in this segment from current_x
+        for (local_idx, run) in seg_runs.iter().enumerate() {
+            if run.is_line_break {
+                drop_soft_hyphen(&mut all_chunks, soft_tail.take());
+                mark_space_after(&mut all_chunks);
+                let line = finish_line_with_break(&mut all_chunks);
+                let mut line = TextLine {
+                    justify_from: std::mem::take(&mut justify_from),
+                    total_width: line.total_width.max(current_x),
+                    ..line
+                };
+                underline_line_end(&mut line, cjk, &pending_spaces, current_x, pending_space_w);
+                result_lines.push(line);
+                tab_wrapped_line = false;
+                tab_line_metrics = None;
+                line_reach = 0.0;
+                current_x = 0.0;
+                is_first_line = false;
+                pending_space_w = 0.0;
+                tab_stop_pos = None;
+                continue;
+            }
+
+            if run.inline_image.is_some() || run.math.is_some() {
+                prev_last_char = None;
+                glued_from = None;
+                if let Some(w) = soft_tail.take() {
+                    drop_soft_hyphen(&mut all_chunks, Some(w));
+                    current_x -= w;
+                }
+            }
+            // Handle inline images (same pattern as build_paragraph_lines)
+            if let Some(img) = &run.inline_image {
+                if let Some(pdf_name) = inline_image_names.get(&seg_indices[local_idx]) {
+                    // A picture that doesn't fit after text or a tab starts
+                    // the next line. A lone tab stays on its own line (Word
+                    // examples: a 420pt picture wraps after plain text with or
+                    // without an earlier tab in a 468pt column).
+                    let img_w = img.layout_size().0;
+                    if current_x > 0.0
+                        && current_x + img_w > line_max_at(is_first_line).max(line_reach)
+                    {
+                        wrap_tabbed_line(
+                            &mut result_lines,
+                            &mut all_chunks,
+                            &mut justify_from,
+                            tab_line_metrics.take(),
+                        );
+                        tab_wrapped_line = false;
+                        line_reach = 0.0;
+                        current_x = 0.0;
+                        is_first_line = false;
+                        tab_stop_pos = None;
+                    }
+                    all_chunks.push(WordChunk::image(
+                        pdf_name,
+                        run,
+                        current_x,
+                        img,
+                        effect_inline_names.get(&seg_indices[local_idx]).cloned(),
+                        seen_fonts
+                            .get(font_key_buf(run, &mut key_buf))
+                            .map_or_else(String::new, |e| e.pdf_name.clone()),
+                    ));
+                    current_x += img_w;
+                }
+                continue;
+            }
+
+            if let Some((entry, mb)) = math_box(run, seen_fonts) {
+                current_x += pending_space_w;
+                pending_space_w = 0.0;
+                all_chunks.push(WordChunk::math(entry, run, mb, current_x));
+                current_x += mb.width;
+                continue;
+            }
+
+            let key = font_key_buf(run, &mut key_buf);
+            let entry = seen_fonts.get(key).expect("font registered");
+            let eff_fs = effective_font_size(run, entry);
+            let text = &run.text;
+            let wr = WordRun {
+                entry,
+                run,
+                eff_fs,
+                cs: run.char_spacing,
+                y_off: vert_y_offset(run),
+            };
+            let width = run_width(run, seen_fonts, &mut key_buf);
+            let mut words: std::collections::VecDeque<_> = split_preserving_spaces(text).into();
+            let mut prev_char = None;
+            let mut first_in_run = true;
+            while let Some((space_count, mut source)) = words.pop_front() {
+                let seg_first = std::mem::take(&mut first_in_run);
+                let mut shown = shown_word(run, source);
+                let mut ww = width(&shown);
+                let space_w = space_count as f32
+                    * word_space_width(run, entry, eff_fs, source, &mut prev_char);
+                if space_count > 0 {
+                    push_pending_space(
+                        &mut pending_spaces,
+                        &mut pending_space_w,
+                        run,
+                        entry,
+                        eff_fs,
+                        space_w,
+                    );
+                }
+                // Word advances over explicit spaces wherever they occur, including
+                // as the first content of a line or right after a tab. Whitespace
+                // that is alone in its run (e.g. "<w:tab/>   " at one size, then
+                // text at another) only reaches here via pending_space_w with
+                // space_count == 0 and nothing emitted yet, so it must still be
+                // applied. pending_space_w is already zeroed at wraps, breaks and
+                // tabs, so this never re-applies absorbed line-end spaces.
+                let applied_space = pending_space_w > 0.0;
+                if applied_space {
+                    mark_space_after(&mut all_chunks);
+                    if !all_chunks.is_empty() {
+                        all_chunks.extend(space_underline(
+                            pending_spaces.last().map(|s| s.run),
+                            entry,
+                            eff_fs,
+                            current_x,
+                            pending_space_w,
+                        ));
+                    }
+                    current_x += pending_space_w;
+                    pending_space_w = 0.0;
+                }
+                // A word right after a soft hyphen on this line takes its
+                // hyphen back, as in `build_paragraph_lines`.
+                let soft = soft_tail.take();
+                // Word continues previous word across run boundary (no whitespace
+                // between) unless the two characters could break inside one run:
+                // a font split between "，" and "57" is a break (issue #163).
+                let is_continuation = seg_first
+                    && !applied_space
+                    && !all_chunks.is_empty()
+                    && soft.is_none()
+                    && !prev_last_char
+                        .zip(shown.chars().next())
+                        .is_some_and(|(a, b)| breaks_between(a, b));
+                let cur_line_max = line_max_at(is_first_line);
+                let word_x = current_x - soft.unwrap_or(0.0);
+                let limit = cur_line_max.max(line_reach);
+                let may_wrap = !all_chunks.is_empty() && !is_continuation;
+                if word_x + ww > limit && may_wrap && source.ends_with(SOFT_HYPHEN) {
+                    (source, shown, ww) = soft_continuation(
+                        run,
+                        source,
+                        &mut words,
+                        width,
+                        || soft_pieces(seg_runs[local_idx + 1..].iter().copied(), seen_fonts),
+                        limit - word_x,
+                        false,
+                    );
+                }
+                let word: &str = &shown;
+                let original = run.caps.then_some(source);
+                let mut overflows = word_x + ww > limit && may_wrap;
+                // Justified compat-15 lines keep the word by narrowing the
+                // spaces after the last tab, as untabbed lines do
+                // (`SPACE_SQUEEZE`); ukrainian_municipal's "1.<tab>Надати …"
+                // line ends in "опалення" with its spaces at 93%.
+                if overflows && cjk.squeeze_spaces && cur_line_max >= line_reach {
+                    let after_tab = all_chunks.get(justify_from..).unwrap_or(&[]);
+                    let lead_space = after_tab.last().map_or(0.0, |last| {
+                        (current_x - last.x_offset - last.width).max(0.0)
+                    });
+                    let spaces = line_space_width(after_tab) + lead_space;
+                    if squeeze_keeps(word_x + ww - cur_line_max, ww, lead_space, spaces)
+                        && word_x + ww - cur_line_max <= SPACE_SQUEEZE * spaces
+                    {
+                        overflows = false;
+                        squeezed_lines.push(result_lines.len());
+                    }
+                }
+                // A word glued over runs moves whole, as on untabbed lines
+                // (Word wraps "ab"+"cdef" as "abcdef"); one that starts right
+                // after its tab stays with the tab.
+                let glued_start = glued_from
+                    .filter(|&g| {
+                        is_continuation
+                            && word_x + ww > limit
+                            && g > justify_from
+                            && g < all_chunks.len()
+                    })
+                    .map(|g| all_chunks.split_off(g));
+                if overflows || glued_start.is_some() {
+                    wrap_tabbed_line(
+                        &mut result_lines,
+                        &mut all_chunks,
+                        &mut justify_from,
+                        tab_line_metrics.take(),
+                    );
+                    tab_wrapped_line = false;
+                    line_reach = 0.0;
+                    current_x = 0.0;
+                    is_first_line = false;
+                    // The stop that opened this segment belongs to the line
+                    // just finished: the next tab resolves from the wrapped
+                    // word's own end (Word keeps "Hub<tab>30<tab>$45" on the
+                    // continuation line of a tab-separated inventory list).
+                    tab_stop_pos = None;
+                    if let Some(moved) = glued_start {
+                        let shift = moved[0].x_offset;
+                        all_chunks.extend(moved.into_iter().map(|mut c| {
+                            c.x_offset -= shift;
+                            c
+                        }));
+                        current_x = word_x - shift;
+                        glued_from = Some(0);
+                    }
+                } else {
+                    drop_soft_hyphen(&mut all_chunks, soft);
+                    current_x = word_x;
+                }
+                if !is_continuation {
+                    glued_from = Some(all_chunks.len());
+                }
+                push_word_chunks(
+                    &mut all_chunks,
+                    &wr,
+                    word,
+                    original,
+                    current_x,
+                    ww,
+                    false,
+                    cjk.compress_punct,
+                );
+                current_x += ww;
+                prev_last_char = word.chars().last();
+                soft_tail = provisional_hyphen(source, word, width);
+            }
+            // Accumulate trailing whitespace for the next run (or the next tab stop)
+            let trailing_spaces = text
+                .chars()
+                .rev()
+                .take_while(|c| is_break_space(*c))
+                .count();
+            if trailing_spaces > 0 {
+                let space_w = trailing_spaces as f32
+                    * word_space_width(run, entry, eff_fs, "", &mut prev_char);
+                push_pending_space(
+                    &mut pending_spaces,
+                    &mut pending_space_w,
+                    run,
+                    entry,
+                    eff_fs,
+                    space_w,
+                );
+            }
+        }
+
+        // For decimal/right/center tabs, text may end before the tab stop position.
+        // Advance current_x past the tab stop so the next tab finds the correct stop.
+        if let Some(ts_pos) = tab_stop_pos {
+            current_x = current_x.max(ts_pos);
+        }
+    }
+
+    // Finalize remaining chunks into the last line. Tabs that wrapped keep
+    // their line though nothing is drawn on it: bulgarian_road_safety's
+    // trailing tabs after "/Зл. Атанасова/" take a second line in Word.
+    // A tab ending the paragraph (or a line before a break) keeps its
+    // extent: Word centres and right-aligns "Name<tab>" by where the tab
+    // ends, leader or not.
+    let ends_in_spaces = all_chunks.is_empty() && pending_space_w > 0.0;
+    if !all_chunks.is_empty() {
+        let line = finish_line(&mut all_chunks);
+        let mut line = TextLine {
+            justify_from: std::mem::take(&mut justify_from),
+            total_width: line.total_width.max(current_x),
+            ..line
+        };
+        underline_line_end(&mut line, cjk, &pending_spaces, current_x, pending_space_w);
+        result_lines.push(line);
+    } else if result_lines.is_empty() || tab_wrapped_line {
+        // A wrapped tab's blank line is sized by the tabs on it, not by a
+        // larger run elsewhere in the paragraph (Word examples: the tab line
+        // after a 20pt picture run steps 11.8pt, as after a 10.5pt one).
+        let mut line = TextLine::default();
+        if tab_wrapped_line {
+            line.hold_tabs(tab_line_metrics);
+        }
+        result_lines.push(line);
+    }
+    for i in squeezed_lines {
+        if let Some(line) = result_lines.get_mut(i) {
+            line.squeezed = true;
+        }
+    }
+
+    push_trailing_break_line(&mut result_lines, runs);
+    if ends_in_spaces && let Some(line) = result_lines.last_mut().filter(|l| l.chunks.is_empty()) {
+        let width = std::mem::replace(&mut line.total_width, current_x);
+        underline_line_end(line, cjk, &pending_spaces, current_x, pending_space_w);
+        if line.end_spaces.is_empty() {
+            line.total_width = width;
+        }
+    }
+
+    finish_lines(&mut result_lines, &cjk);
+    result_lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leading_space_wrap_uses_space_font_pitch() {
+        let mut lines = vec![
+            TextLine {
+                leading_space_wrap: true,
+                break_font_size: Some(7.5),
+                break_lhr: Some(1.2),
+                ..Default::default()
+            },
+            TextLine {
+                break_font_size: Some(7.5),
+                break_lhr: Some(1.2),
+                ..Default::default()
+            },
+        ];
+        size_lines_by_own_runs(
+            &mut lines,
+            &HashMap::new(),
+            LineSpacing::Auto(1.0),
+            14.0,
+            10.0,
+            1.0,
+            crate::model::TextAlignment::Auto,
+        );
+        assert!((lines[0].pitch.unwrap() - 9.0).abs() < 0.001);
+        assert!(
+            lines[1].pitch.is_none(),
+            "ordinary empty lines keep paragraph pitch"
+        );
+    }
+
+    fn plain_layout(squeeze_spaces: bool) -> CjkLayout {
+        CjkLayout {
+            punct_half_out: false,
+            auto_space: false,
+            compress_punct: false,
+            punct_pull: false,
+            punct_cut_last: false,
+            balance_sbdb: false,
+            punct_pull_free_ratio: 0.0,
+            punct_pull_free_em: 0.0,
+            squeeze_spaces,
+            squeeze_line: false,
+            line_reserve: 0.0,
+            expand_shift_return: true,
+            ul_trail_space: false,
+            bidi: false,
+            shaped_kerning: false,
+            break_words: false,
+        }
+    }
+    use crate::model::{LineSpacing, VertAlign};
+
+    #[test]
+    fn overwide_word_cuts_at_the_last_fitting_char() {
+        let width = |w: &str| w.chars().count() as f32 * 3.0;
+        assert_eq!(fitting_prefix_len("..........", 10.0, width), Some(3));
+        assert_eq!(fitting_prefix_len("....", 1.0, width), Some(1));
+        assert_eq!(fitting_prefix_len("é…é", 6.0, width), Some("é…".len()));
+        assert_eq!(fitting_prefix_len(".", 1.0, width), None);
+    }
+
+    #[test]
+    fn underlining_word_spaces_preserves_squeeze_decisions() {
+        let fonts = HashMap::from([("Arial".to_string(), FontEntry::stub())]);
+        let build = |underline, width| {
+            let run = Run {
+                text: "aa aa aa aa aa".into(),
+                underline,
+                ..make_run(10.0, VertAlign::Baseline, false)
+            };
+            build_paragraph_lines(
+                &[run],
+                &fonts,
+                width,
+                0.0,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+                None,
+                None,
+                CjkLayout {
+                    auto_space: false,
+                    compress_punct: false,
+                    punct_pull: false,
+                    punct_cut_last: false,
+            balance_sbdb: false,
+                    punct_pull_free_ratio: 0.0,
+                    punct_pull_free_em: 0.0,
+                    squeeze_spaces: true,
+                    punct_half_out: false,
+                    expand_shift_return: true,
+                    ul_trail_space: false,
+                    squeeze_line: false,
+                    line_reserve: 0.0,
+                    bidi: false,
+                    shaped_kerning: false,
+                    break_words: false,
+                },
+            )
+            .len()
+        };
+        for width in [45.0, 50.0, 55.0, 60.0, 65.0, 68.0, 70.0] {
+            assert_eq!(build(false, width), build(true, width), "width={width}");
+        }
+        let entry = FontEntry::stub();
+        let tab = WordChunk::tab_underline(&entry, 10.0, None, Default::default(), None, 0.0, 30.0);
+        let space = WordChunk::word_space_underline(
+            &entry,
+            10.0,
+            None,
+            Default::default(),
+            None,
+            30.0,
+            3.0,
+        );
+        assert_eq!(line_space_width(&[tab, space]), 3.0);
+    }
+
+    #[test]
+    fn justify_counts_word_spaces_not_run_joins() {
+        let entry = FontEntry::stub();
+        let chunk = |text: &str, x: f32, w: f32| {
+            let mut c =
+                WordChunk::tab_underline(&entry, 12.0, None, Default::default(), None, x, w);
+            c.text = text.to_string();
+            c
+        };
+        // "ab" split across two runs, a gap, then "cd", an underlined space chunk, "ef"
+        let chunks = vec![
+            chunk("a", 0.0, 6.0),
+            chunk("b", 6.0, 6.0),
+            chunk("cd", 15.0, 12.0),
+            chunk("", 27.0, 3.0),
+            chunk("ef", 30.0, 12.0),
+        ];
+        assert_eq!(spaces_before_each(&chunks), vec![0, 0, 1, 1, 2]);
+    }
+
+    #[test]
+    fn japanese_adjacent_marks_are_counted() {
+        assert_eq!(ja_adjacent_marks("大学院）・専門"), 1);
+        assert_eq!(ja_adjacent_marks("高卒・高校"), 0);
+        assert_eq!(ja_adjacent_marks("）（"), 1);
+    }
+
+    #[test]
+    fn hinted_quotes_get_their_own_segments() {
+        assert_eq!(punct_segments("在“测”船", true), vec!["在", "“测”", "船"]);
+        assert_eq!(punct_segments("在“测”船", false), vec!["在“测”船"]);
+        assert_eq!(punct_segments("“测试", true), vec!["“测试"]);
+        assert_eq!(punct_segments("试”", true), vec!["试”"]);
+        assert_eq!(punct_segments("2021《进出", false), vec!["2021", "《进出"]);
+    }
+
+    #[test]
+    fn compress_punctuation_trims_marks_evenly_and_shifts_followers() {
+        let entry = FontEntry::stub();
+        let chunk = |text: &str, x: f32| {
+            let mut c =
+                WordChunk::tab_underline(&entry, 16.0, None, Default::default(), None, x, 32.0);
+            c.text = text.to_string();
+            c
+        };
+        let mut chunks = vec![
+            chunk("任，", 0.0),
+            chunk("負", 32.0),
+            chunk("事、", 64.0),
+            chunk("公", 96.0),
+        ];
+        assert_eq!(compress_punctuation(&mut chunks, 4.0, None), Some(0.0));
+        // 2pt off each mark; everything after a mark slides left
+        assert!((chunks[0].width - 30.0).abs() < 1e-4 && (chunks[2].width - 30.0).abs() < 1e-4);
+        assert!((chunks[1].x_offset - 30.0).abs() < 1e-4);
+        assert!((chunks[2].x_offset - 62.0).abs() < 1e-4);
+        assert!((chunks[3].x_offset - 92.0).abs() < 1e-4);
+        // The next word raises the same level on every mark: 2.5pt more each.
+        assert_eq!(compress_punctuation(&mut chunks, 5.0, None), Some(0.0));
+        assert!((chunks[0].width - 27.5).abs() < 1e-4 && (chunks[2].width - 27.5).abs() < 1e-4);
+        assert!((chunks[3].x_offset - 87.0).abs() < 1e-4);
+        // Past PUNCT_SQUEEZE of the em (8pt at 16pt) the word wraps instead:
+        // 8 more would need 8.5 per mark, so nothing moves.
+        assert_eq!(compress_punctuation(&mut chunks, 8.0, None), None);
+        assert!((chunks[0].width - 27.5).abs() < 1e-4);
+        // The incoming word's own mark shares the level: 6 over three marks is
+        // 2 each, the third cut handed back for the caller to take off that word.
+        let mut fresh = vec![chunk("任，", 0.0), chunk("事、", 32.0), chunk("公", 64.0)];
+        let cut = compress_punctuation(&mut fresh, 6.0, Some(16.0)).unwrap();
+        assert!((cut - 2.0).abs() < 1e-4 && (fresh[1].width - 30.0).abs() < 1e-4);
+        assert!((fresh[2].x_offset - 60.0).abs() < 1e-4);
+        let mut plain = vec![chunk("任負", 0.0)];
+        assert_eq!(compress_punctuation(&mut plain, 1.0, None), None);
+    }
+
+    #[test]
+    fn test_char_justify_gaps() {
+        // Latin justify spreads word gaps, not characters.
+        assert_eq!(char_justify_gaps(Alignment::Justify, true, false, 10), None);
+        // CJK justify keeps the grid's trailing cell gap: divide by char count.
+        assert_eq!(
+            char_justify_gaps(Alignment::Justify, true, true, 10),
+            Some(10)
+        );
+        // distribute ends flush at the right margin: one gap fewer.
+        assert_eq!(
+            char_justify_gaps(Alignment::Distribute, true, false, 10),
+            Some(9)
+        );
+        // distribute ends flush at both margins whatever the script.
+        assert_eq!(
+            char_justify_gaps(Alignment::Distribute, true, true, 10),
+            Some(9)
+        );
+        // A single character has no gap to spread into (guards a 0 divisor).
+        assert_eq!(
+            char_justify_gaps(Alignment::Distribute, true, false, 1),
+            None
+        );
+        // Last line of a justified paragraph, and non-stretching alignments.
+        assert_eq!(char_justify_gaps(Alignment::Justify, false, true, 10), None);
+        assert_eq!(char_justify_gaps(Alignment::Left, false, true, 10), None);
+    }
+
+    #[test]
+    fn url_wraps_only_after_hyphens() {
+        let words: Vec<&str> =
+            split_preserving_spaces("see https://example.com/foo/bar?x=1&y=2#frag after")
+                .into_iter()
+                .map(|(_, w)| w)
+                .collect();
+        assert_eq!(
+            words,
+            vec!["see", "https://example.com/foo/bar?x=1&y=2#frag", "after"]
+        );
+        let words: Vec<&str> = split_preserving_spaces("www.gov.hr/pristup-informacijama/ x")
+            .into_iter()
+            .map(|(_, w)| w)
+            .collect();
+        assert_eq!(words, vec!["www.gov.hr/pristup-", "informacijama/", "x"]);
+    }
+
+    #[test]
+    fn test_no_break_after_ellipsis_inside_token() {
+        // TOC dot-leaders typed as ellipses: "Preparation………45" is one
+        // unbreakable token in Word, but UAX #14 allows IN→NU breaks.
+        let words: Vec<&str> = split_preserving_spaces("Preparation………45 done")
+            .into_iter()
+            .map(|(_, w)| w)
+            .collect();
+        assert_eq!(words, vec!["Preparation………45", "done"]);
+        // A break after ellipsis before whitespace is still fine.
+        let words: Vec<&str> = split_preserving_spaces("wait… go")
+            .into_iter()
+            .map(|(_, w)| w)
+            .collect();
+        assert_eq!(words, vec!["wait…", "go"]);
+    }
+
+    #[test]
+    fn test_is_break_space() {
+        assert!(is_break_space(' '));
+        assert!(is_break_space('\t'));
+        assert!(is_break_space('\n'));
+        // Non-breaking space is NOT a break space
+        assert!(!is_break_space('\u{00a0}'));
+        // Ideographic space is NOT a break space
+        assert!(!is_break_space('\u{3000}'));
+        // Regular chars
+        assert!(!is_break_space('a'));
+        assert!(!is_break_space('1'));
+    }
+
+    fn make_run(font_size: f32, valign: VertAlign, small_caps: bool) -> Run {
+        Run {
+            font_name: "Arial".to_string(),
+            font_size,
+            vertical_align: valign,
+            small_caps,
+            text_scale: 100.0,
+            ..Run::default()
+        }
+    }
+
+    #[test]
+    fn full_width_opener_breaks_after_latin() {
+        for (a, b) in [('7', '（'), ('b', '（'), ('7', '【'), ('7', '「')] {
+            assert!(breaks_between(a, b), "{a}{b}");
+        }
+        assert!(!breaks_between('7', '('));
+    }
+
+    #[test]
+    fn breaks_between_matches_splitting_inside_a_run() {
+        let chars = [
+            'a', 'Z', '-', '/', ',', '.', '(', ')', '…', '⁞', '中', '文', '。', '「', 'é', '1',
+            '%', '$',
+        ];
+        for a in chars {
+            for b in chars {
+                let split = split_preserving_spaces(&format!("{a}{b}")).len() > 1;
+                assert_eq!(breaks_between(a, b), split, "{a:?}{b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn period_and_opening_parenthesis_stay_in_one_token() {
+        assert_eq!(
+            split_preserving_spaces("2023г.(note)"),
+            vec![(0, "2023г.(note)")]
+        );
+        assert_eq!(
+            split_preserving_spaces("2023г. (note)"),
+            vec![(0, "2023г."), (1, "(note)")]
+        );
+        assert!(!breaks_between('.', '('));
+    }
+
+    #[test]
+    fn hyphen_runs_break_between_hyphens() {
+        assert_eq!(
+            split_preserving_spaces("a---b"),
+            vec![(0, "a-"), (0, "-"), (0, "-"), (0, "b")]
+        );
+    }
+
+    #[test]
+    fn hyphen_can_break_before_opening_guillemet() {
+        assert_eq!(
+            split_preserving_spaces("«North Ural»-«Branch»"),
+            vec![(0, "«North"), (1, "Ural»-"), (0, "«Branch»")]
+        );
+        assert!(breaks_between('-', '«'));
+        assert!(!breaks_between('\u{2011}', '«'));
+    }
+
+    #[test]
+    fn hyphen_breaks_before_a_digit() {
+        assert_eq!(
+            split_preserving_spaces("2019-2024"),
+            vec![(0, "2019-"), (0, "2024")]
+        );
+    }
+
+    #[test]
+    fn nbsp_space_sequences_keep_words_together_across_runs() {
+        let fonts = HashMap::from([("Arial".to_string(), FontEntry::stub())]);
+        let run = |s: &str| Run {
+            text: s.into(),
+            ..make_run(10.0, VertAlign::Baseline, false)
+        };
+        for pieces in [
+            vec!["aaaa bb\u{00a0} cc dd"],
+            vec!["aaaa ", "bb\u{00a0}", " ", "cc dd"],
+            vec!["aaaa ", "bb\u{00a0}", "  ", "cc dd"],
+            vec!["aaaa ", "bb ", "\u{00a0}", "cc dd"],
+        ] {
+            let runs: Vec<_> = pieces.iter().map(|s| run(s)).collect();
+            let lines = build_paragraph_lines(
+                &runs,
+                &fonts,
+                50.0,
+                0.0,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+                None,
+                None,
+                plain_layout(false),
+            );
+            assert_eq!(lines.len(), 2, "{pieces:?}");
+            assert_eq!(
+                lines[0]
+                    .chunks
+                    .iter()
+                    .map(|c| c.text.as_str())
+                    .collect::<String>(),
+                "aaaa",
+                "{pieces:?}"
+            );
+            let second = lines[1]
+                .chunks
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<String>();
+            assert!(
+                second.contains("bb") && second.contains("cc"),
+                "{pieces:?}: {second}"
+            );
+            let expected_spaces = if pieces.iter().any(|s| *s == "  ") {
+                3
+            } else {
+                2
+            };
+            assert_eq!(
+                spaces_before_each(&lines[1].chunks).last().copied(),
+                Some(expected_spaces)
+            );
+        }
+        assert_eq!(
+            split_preserving_spaces("bb  cc"),
+            vec![(0, "bb"), (2, "cc")]
+        );
+    }
+
+    #[test]
+    fn abbreviation_before_numero_sign_stays_together() {
+        assert_eq!(split_preserving_spaces("ст.№4"), vec![(0, "ст.№4")]);
+        assert_eq!(
+            split_preserving_spaces("st.№ 4"),
+            vec![(0, "st.№"), (1, "4")]
+        );
+        assert_eq!(
+            split_preserving_spaces("st. №4"),
+            vec![(0, "st."), (1, "№4")]
+        );
+        assert!(!breaks_between('.', '№'));
+        assert!(breaks_between(' ', '№'));
+    }
+
+    #[test]
+    fn squeeze_keeps_words_to_word_probe_thresholds() {
+        // Arial: 11pt space 3.0562, 16pt space 4.4453; spaces before the word.
+        for (word_w, lead, count, keeps_to, wraps_at) in [
+            (24.0, 0.0, 0.0, 7.99, 8.1),
+            (12.0, 0.0, 0.0, 3.99, 4.1),
+            (11.0, 3.0562, 10.0, 5.015, 5.065),
+            (11.0, 3.0562, 30.0, 4.7451, 4.7951),
+            (15.8984, 3.0562, 10.0, 6.7635, 6.8135),
+            (15.8984, 3.0562, 20.0, 6.5285, 6.5785),
+            (15.8984, 3.0562, 30.0, 6.4436, 6.4936),
+            (25.6792, 3.0562, 30.0, 9.7743, 9.8243),
+            (40.37, 3.0562, 20.0, 14.94, 15.049),
+            (16.0, 4.4453, 14.0, 7.1406, 7.1906),
+            (23.125, 4.4453, 14.0, 9.6156, 9.6656),
+            (37.3516, 4.4453, 14.0, 14.5922, 14.6422),
+            // Times New Roman 12pt "Dále", Arial 11pt "der": the slack.
+            (22.652344, 3.0, 16.0, 8.922954, 8.928564),
+            (15.898438, 3.056152, 10.0, 6.769896, 6.770706),
+        ] {
+            let spaces = lead * count;
+            assert!(
+                squeeze_keeps(keeps_to, word_w, lead, spaces),
+                "{word_w} {count}"
+            );
+            assert!(
+                !squeeze_keeps(wraps_at, word_w, lead, spaces),
+                "{word_w} {count}"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_after_hyphen_squeezes_like_a_word_after_a_space() {
+        let fonts = HashMap::from([("Arial".to_string(), FontEntry::stub())]);
+        let run = |s: &str| Run {
+            text: s.into(),
+            ..make_run(10.0, VertAlign::Baseline, false)
+        };
+        for suffix in ["PP.", "x", "12-", "05215", "AB2C2", "12345/2026", "and/or"] {
+            let text = format!("aa aa aa aa 11-{suffix}");
+            for runs in [vec![run(&text)], vec![run("aa aa aa aa 11-"), run(suffix)]] {
+                let build = |overflow, squeeze| {
+                    build_paragraph_lines(
+                        &runs,
+                        &fonts,
+                        text.len() as f32 * 5.0 - overflow,
+                        0.0,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        None,
+                        None,
+                        None,
+                        plain_layout(squeeze),
+                    )
+                };
+                let lines = build(1.0, true);
+                assert_eq!(lines.len(), 1, "{suffix}");
+                assert!(lines[0].squeezed);
+                assert_eq!(build(1.0, false).len(), 2, "{suffix}");
+                assert_eq!(build(6.0, true).len(), 2, "{suffix}");
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_spaces_keep_their_justification_weight_across_runs() {
+        let fonts = HashMap::from([("Arial".to_string(), FontEntry::stub())]);
+        let run = |s: &str| Run {
+            text: s.into(),
+            ..make_run(10.0, VertAlign::Baseline, false)
+        };
+        for runs in [
+            vec![run("Label  MARK tail")],
+            vec![run("Label "), run(" "), run("MARK tail")],
+        ] {
+            let lines = build_paragraph_lines(
+                &runs,
+                &fonts,
+                200.0,
+                0.0,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+                None,
+                None,
+                plain_layout(false),
+            );
+            assert_eq!(spaces_before_each(&lines[0].chunks), vec![0, 2, 3]);
+        }
+        let lines = build_paragraph_lines(
+            &[run("Label  MARK tail")],
+            &fonts,
+            35.0,
+            0.0,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            plain_layout(false),
+        );
+        for line in lines {
+            assert_eq!(spaces_before_each(&line.chunks)[0], 0);
+        }
+    }
+
+    #[test]
+    fn word_split_over_runs_wraps_as_a_whole() {
+        let mut fonts = HashMap::new();
+        fonts.insert("Arial".to_string(), FontEntry::stub());
+        let text_run = |text: &str| Run {
+            text: text.to_string(),
+            ..make_run(10.0, VertAlign::Baseline, false)
+        };
+        let runs = [text_run("aaaa bbb"), text_run("ccc")];
+        let cjk = plain_layout(false);
+        let lines = build_paragraph_lines(
+            &runs,
+            &fonts,
+            40.0,
+            0.0,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            cjk,
+        );
+        let texts: Vec<Vec<&str>> = lines
+            .iter()
+            .map(|l| l.chunks.iter().map(|c| c.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, vec![vec!["aaaa"], vec!["bbb", "ccc"]]);
+        assert_eq!(lines[1].chunks[0].x_offset, 0.0);
+    }
+
+    #[test]
+    fn overwide_word_after_text_breaks_at_the_new_lines_margin() {
+        let mut fonts = HashMap::new();
+        fonts.insert("Arial".to_string(), FontEntry::stub());
+        let runs = [Run {
+            text: "aa bbbbbbbbbb".to_string(),
+            ..make_run(10.0, VertAlign::Baseline, false)
+        }];
+        let cjk = plain_layout(false);
+        let lines = build_paragraph_lines(
+            &runs,
+            &fonts,
+            40.0,
+            0.0,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            cjk,
+        );
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.chunks.iter().map(|c| c.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, vec!["aa", "bbbbbbbb", "bb"]);
+    }
+
+    #[test]
+    fn grid_line_spacing_multiple_scales_the_cells() {
+        // 12pt Times New Roman (sTypo 1.06 em) needs one 18pt cell; at 1.5
+        // lines Word makes the line 27pt (case79), not two cells.
+        let mut fonts = HashMap::new();
+        fonts.insert(
+            "Arial".to_string(),
+            FontEntry {
+                grid_line_ratio: Some(1.06),
+                ..FontEntry::stub()
+            },
+        );
+        let runs = [Run {
+            text: "Hxgp".to_string(),
+            ..make_run(12.0, VertAlign::Baseline, false)
+        }];
+        let h = |ls| grid_snapped_line_h(&runs, &fonts, ls, 13.8, 18.0);
+        assert_eq!(h(crate::model::LineSpacing::Auto(1.0)), 18.0);
+        assert_eq!(h(crate::model::LineSpacing::Auto(1.5)), 27.0);
+        let big = [Run {
+            text: "Hxgp".to_string(),
+            ..make_run(22.0, VertAlign::Baseline, false)
+        }];
+        let h2 = |ls| grid_snapped_line_h(&big, &fonts, ls, 25.3, 15.6);
+        assert_eq!(h2(crate::model::LineSpacing::Auto(1.5)), 31.2);
+        assert_eq!(h2(crate::model::LineSpacing::Auto(3.0)), 15.6 * 3.0);
+    }
+
+    #[test]
+    fn grid_baseline_centres_the_largest_run_in_its_cell() {
+        // MS Gothic (win 0.859 / 0.141) 16pt on two 18pt cells: Word's baseline
+        // sits 23.67pt into the line (japanese_interlibrary_loan).
+        let mut fonts = HashMap::new();
+        fonts.insert(
+            "Arial".to_string(),
+            FontEntry {
+                grid_baseline_shift: Some(0.3594),
+                ..FontEntry::stub()
+            },
+        );
+        let text_run = |text: &str, font_size: f32| Run {
+            text: text.to_string(),
+            ..make_run(font_size, VertAlign::Baseline, false)
+        };
+        let runs = [
+            text_run("a", 10.0),
+            text_run("b", 16.0),
+            text_run("  ", 30.0),
+        ];
+        let offset = grid_baseline_offset(&runs, &fonts, 36.0).unwrap();
+        assert!((offset - 23.75).abs() < 0.01, "{offset}");
+    }
+
+    #[test]
+    fn segment_width_counts_each_space_once_across_runs() {
+        let mut fonts = HashMap::new();
+        fonts.insert("Arial".to_string(), FontEntry::stub());
+        let width = |texts: &[&str]| {
+            let runs: Vec<Run> = texts
+                .iter()
+                .map(|t| Run {
+                    text: t.to_string(),
+                    ..make_run(10.0, VertAlign::Baseline, false)
+                })
+                .collect();
+            let refs: Vec<&Run> = runs.iter().collect();
+            segment_width(&refs, &fonts)
+        };
+        // Every glyph is 5pt: "a b" is three of them however the runs split.
+        assert_eq!(width(&["a b"]), 15.0);
+        assert_eq!(width(&["a ", "b"]), 15.0);
+        assert_eq!(width(&["a", " b"]), 15.0);
+        assert_eq!(width(&["a", " ", "b"]), 15.0);
+        assert_eq!(width(&["a ", " b"]), 20.0);
+        assert_eq!(width(&["a", "b"]), 10.0);
+        // Leading and trailing spaces are not the segment's.
+        assert_eq!(width(&["  a", "b  "]), 10.0);
+    }
+
+    /// Standard-14-style entry with every WinAnsi glyph 500/1000 wide.
+    #[test]
+    fn list_text_tabs_past_label_and_first_line_indent() {
+        let mut fonts = HashMap::new();
+        fonts.insert("Arial".into(), FontEntry::stub());
+        let mut para = crate::model::Paragraph {
+            runs: vec![make_run(10.0, VertAlign::Baseline, false)],
+            list_label: "1.".into(),
+            indent_first_line: 28.35,
+            tab_stops: vec![
+                TabStop {
+                    position: 21.3,
+                    alignment: TabAlignment::Left,
+                    leader: None,
+                },
+                TabStop {
+                    position: 42.55,
+                    alignment: TabAlignment::Left,
+                    leader: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let hanging =
+            |p: &crate::model::Paragraph| super::super::list_label::text_hanging(p, 36.0, &fonts);
+        assert!((hanging(&para) + 42.55).abs() < 0.01);
+        para.indent_first_line = 0.0;
+        para.indent_left = -5.0;
+        para.indent_hanging = 0.25;
+        para.tab_stops[0].position = 8.55;
+        assert!((hanging(&para) + 13.55).abs() < 0.01);
+        para.indent_left = 0.0;
+        para.indent_hanging = 0.0;
+        para.tab_stops.clear();
+        assert!((hanging(&para) + 36.0).abs() < 0.01);
+        para.indent_left = 36.0;
+        para.indent_hanging = 18.0;
+        para.tab_stops.push(TabStop {
+            position: 20.1,
+            alignment: TabAlignment::Left,
+            leader: None,
+        });
+        assert!(hanging(&para).abs() < 0.01);
+        para.indent_left = 0.0;
+        para.indent_hanging = 0.0;
+        para.tab_stops.clear();
+        para.list_label = "12345678.".into();
+        assert!((hanging(&para) + 72.0).abs() < 0.01);
+        // A label exactly filling the hanging indent keeps the text on it
+        // (Word for Mac probe p23); one 5pt wider goes to the next default
+        // stop, and an explicit stop the label ends on is skipped like any
+        // tab (indigenous_innovation p5).
+        para.list_label = "123.".into();
+        para.indent_left = 20.0;
+        para.indent_hanging = 20.0;
+        assert!(hanging(&para).abs() < 0.01);
+        para.list_label = "1234.".into();
+        assert!((hanging(&para) + 16.0).abs() < 0.01);
+        para.indent_left = 40.0;
+        para.indent_hanging = 40.0;
+        para.tab_stops.push(TabStop {
+            position: 25.0,
+            alignment: TabAlignment::Left,
+            leader: None,
+        });
+        assert!(hanging(&para).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_tabbed_line_applies_whitespace_only_run_after_tab() {
+        // "<w:tab/>   " at 10pt followed by "x" at 9pt: the size difference keeps
+        // the spaces in their own run, and Word still advances over them, so the
+        // word starts at tab stop + 3 space widths rather than at the stop itself.
+        let text_run = |text: &str, font_size: f32| Run {
+            text: text.to_string(),
+            ..make_run(font_size, VertAlign::Baseline, false)
+        };
+        let tab = Run {
+            is_tab: true,
+            ..make_run(10.0, VertAlign::Baseline, false)
+        };
+        let runs = [tab, text_run("   ", 10.0), text_run("x", 9.0)];
+        let mut fonts = HashMap::new();
+        fonts.insert("Arial".to_string(), FontEntry::stub());
+        let stops = [TabStop {
+            position: 100.0,
+            alignment: TabAlignment::Left,
+            leader: None,
+        }];
+        let lines = build_tabbed_line(
+            &runs,
+            &fonts,
+            &stops,
+            0.0,
+            400.0,
+            0.0,
+            0.0,
+            &HashMap::new(),
+            &HashMap::new(),
+            36.0,
+            &[],
+            15,
+            plain_layout(false),
+        );
+        assert_eq!(lines.len(), 1);
+        let word = lines[0]
+            .chunks
+            .iter()
+            .find(|c| c.text == "x")
+            .expect("word chunk");
+        let expected = 100.0 + 3.0 * fonts["Arial"].space_width(10.0);
+        assert!(
+            (word.x_offset - expected).abs() < 0.01,
+            "x_offset {} != {expected}",
+            word.x_offset
+        );
+    }
+
+    #[test]
+    fn tabbed_justified_line_squeezes_spaces_after_the_tab() {
+        // Stub glyphs are 5pt at 10pt: after the stop at 10, "aa aa aa aa aa"
+        // ends at 80, 3pt past a 77pt measure; four 5pt spaces may give 5pt.
+        let tab = Run {
+            is_tab: true,
+            ..make_run(10.0, VertAlign::Baseline, false)
+        };
+        let text = Run {
+            text: "aa aa aa aa aa".to_string(),
+            ..make_run(10.0, VertAlign::Baseline, false)
+        };
+        let runs = [tab, text];
+        let mut fonts = HashMap::new();
+        fonts.insert("Arial".to_string(), FontEntry::stub());
+        let stops = [TabStop {
+            position: 10.0,
+            alignment: TabAlignment::Left,
+            leader: None,
+        }];
+        let lines = |squeeze| {
+            build_tabbed_line(
+                &runs,
+                &fonts,
+                &stops,
+                0.0,
+                77.0,
+                0.0,
+                0.0,
+                &HashMap::new(),
+                &HashMap::new(),
+                36.0,
+                &[],
+                15,
+                plain_layout(squeeze),
+            )
+        };
+        let squeezed = lines(true);
+        assert_eq!(squeezed.len(), 1);
+        assert!(squeezed[0].squeezed);
+        assert_eq!(lines(false).len(), 2);
+    }
+
+    #[test]
+    fn underlined_spaces_before_a_wrapping_tab_end_the_line_underlined() {
+        let run = |text: &str, underline: bool, is_tab: bool| Run {
+            text: text.to_string(),
+            underline,
+            is_tab,
+            ..make_run(10.0, VertAlign::Baseline, false)
+        };
+        let runs = [
+            run("aaaa   ", true, false),
+            run("", false, true),
+            run("aaaaaaaa", false, false),
+        ];
+        let mut fonts = HashMap::new();
+        fonts.insert("Arial".to_string(), FontEntry::stub());
+        let cjk = CjkLayout {
+            ul_trail_space: true,
+            ..plain_layout(false)
+        };
+        let lines = build_tabbed_line(
+            &runs,
+            &fonts,
+            &[],
+            0.0,
+            60.0,
+            0.0,
+            0.0,
+            &HashMap::new(),
+            &HashMap::new(),
+            36.0,
+            &[],
+            15,
+            cjk,
+        );
+        assert_eq!(lines.len(), 2);
+        let trail: Vec<(f32, f32)> = lines[0]
+            .end_spaces
+            .iter()
+            .map(|s| (s.x_offset, s.width))
+            .collect();
+        assert_eq!(trail, [(20.0, 15.0)]);
+    }
+
+    #[test]
+    fn test_effective_font_size_baseline() {
+        let run = make_run(12.0, VertAlign::Baseline, false);
+        assert_eq!(effective_font_size(&run, &FontEntry::stub()), 12.0);
+    }
+
+    #[test]
+    fn test_effective_font_size_superscript() {
+        // Aptos (OS/2 0.600) 12pt superscripts are 7pt in Word, Times (0.650) 8pt.
+        let mut entry = FontEntry::stub();
+        entry.superscript_ratio = Some(0.6);
+        let run = make_run(12.0, VertAlign::Superscript, false);
+        assert_eq!(effective_font_size(&run, &entry), 7.0);
+        entry.superscript_ratio = Some(0.65);
+        assert_eq!(effective_font_size(&run, &entry), 8.0);
+    }
+
+    #[test]
+    fn test_effective_font_size_subscript() {
+        // 9.5pt at 0.650 is 6.175, Word draws 6.0.
+        let mut entry = FontEntry::stub();
+        entry.subscript_ratio = Some(0.65);
+        let run = make_run(9.5, VertAlign::Subscript, false);
+        assert_eq!(effective_font_size(&run, &entry), 6.0);
+    }
+
+    #[test]
+    fn test_effective_font_size_ignores_small_caps() {
+        // smallCaps sizing is per-segment, not per-run — effective_font_size returns base size
+        let run = make_run(12.0, VertAlign::Baseline, true);
+        assert_eq!(effective_font_size(&run, &FontEntry::stub()), 12.0);
+    }
+
+    #[test]
+    fn test_smallcaps_segments_mixed() {
+        let segs = smallcaps_segments("Hello", 12.0);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0], ("H".to_string(), 12.0, "H")); // uppercase stays at 12pt
+        assert_eq!(segs[1], ("ELLO".to_string(), 9.5, "ello")); // lowercase → uppercase at 9.5pt
+    }
+
+    #[test]
+    fn test_smallcaps_segments_all_upper() {
+        let segs = smallcaps_segments("ABC", 12.0);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0], ("ABC".to_string(), 12.0, "ABC"));
+    }
+
+    #[test]
+    fn test_smallcaps_segments_all_lower() {
+        let segs = smallcaps_segments("abc", 12.0);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0], ("ABC".to_string(), 9.5, "abc"));
+    }
+
+    #[test]
+    fn small_caps_spaces_follow_their_neighbours() {
+        // Word probe: a space beside a lowercase letter is small, ". 1" is not.
+        let segs = smallcaps_segments("def X. 12", 12.0);
+        assert_eq!(segs[0], ("DEF ".to_string(), 9.5, "def "));
+        assert_eq!(segs[1], ("X. 12".to_string(), 12.0, "X. 12"));
+    }
+
+    #[test]
+    fn test_smallcaps_segments_with_nonletters() {
+        // Non-letter chars (digits, punctuation) stay at base size, grouped with adjacent same-size
+        let segs = smallcaps_segments("A1b", 12.0);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0], ("A1".to_string(), 12.0, "A1")); // uppercase + digit both at base size
+        assert_eq!(segs[1], ("B".to_string(), 9.5, "b")); // lowercase → uppercase at reduced size
+    }
+
+    #[test]
+    fn caps_and_small_caps_keep_their_source_letters() {
+        let entry = FontEntry::stub();
+        let chunks_for = |run: &Run, word: &str, original: Option<&str>| {
+            let mut chunks = Vec::new();
+            let wr = WordRun {
+                entry: &entry,
+                run,
+                eff_fs: 12.0,
+                cs: 0.0,
+                y_off: 0.0,
+            };
+            push_word_chunks(&mut chunks, &wr, word, original, 0.0, 30.0, false, false);
+            chunks
+                .into_iter()
+                .map(|c| (c.text, c.actual_text))
+                .collect::<Vec<_>>()
+        };
+        let small_caps = Run {
+            small_caps: true,
+            ..Run::default()
+        };
+        assert_eq!(
+            chunks_for(&small_caps, "Hello", None),
+            [("H".into(), None), ("ELLO".into(), Some("ello".into()))]
+        );
+        let caps = Run {
+            caps: true,
+            ..Run::default()
+        };
+        assert_eq!(caps_word(&caps, "Pirmasis"), "PIRMASIS");
+        assert_eq!(
+            chunks_for(&caps, "PIRMASIS", Some("Pirmasis")),
+            [("PIRMASIS".into(), Some("Pirmasis".into()))]
+        );
+        // Both on: the word is already all capitals, one segment, the caps original.
+        let both = Run {
+            caps: true,
+            small_caps: true,
+            ..Run::default()
+        };
+        assert_eq!(
+            chunks_for(&both, "PIRMASIS", Some("Pirmasis")),
+            [("PIRMASIS".into(), Some("Pirmasis".into()))]
+        );
+        assert_eq!(
+            chunks_for(&Run::default(), "plain", None),
+            [("plain".into(), None)]
+        );
+    }
+
+    #[test]
+    fn complex_script_words_take_the_bidi_language() {
+        let run = Run {
+            text_lang: Some("en-US".into()),
+            text_lang_east_asia: Some("ja-JP".into()),
+            text_lang_bidi: Some("ar-SA".into()),
+            ..Run::default()
+        };
+        let lang = |text| chunk_lang(&run, text).map(|l| l.to_string());
+        assert_eq!(lang("الأرز").as_deref(), Some("ar-SA"));
+        assert_eq!(lang("日本").as_deref(), Some("ja-JP"));
+        assert_eq!(lang("rice").as_deref(), Some("en-US"));
+        let no_bidi = Run {
+            text_lang_bidi: None,
+            ..run.clone()
+        };
+        assert_eq!(
+            chunk_lang(&no_bidi, "الأرز").as_deref(),
+            Some("en-US"),
+            "without @bidi the run's language stands"
+        );
+    }
+
+    #[test]
+    fn test_vert_y_offset_baseline() {
+        let run = make_run(12.0, VertAlign::Baseline, false);
+        assert_eq!(vert_y_offset(&run), 0.0);
+    }
+
+    #[test]
+    fn test_vert_y_offset_superscript() {
+        let run = make_run(12.0, VertAlign::Superscript, false);
+        let expected = 12.0 * 0.35; // 4.2
+        assert!((vert_y_offset(&run) - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_vert_y_offset_subscript() {
+        let run = make_run(12.0, VertAlign::Subscript, false);
+        let expected = -12.0 * 0.14; // -1.68
+        assert!((vert_y_offset(&run) - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_vert_y_offset_adds_position() {
+        let mut run = make_run(12.0, VertAlign::Superscript, false);
+        run.position = -3.0;
+        assert!((vert_y_offset(&run) - (12.0 * 0.35 - 3.0)).abs() < 0.01);
+    }
+}

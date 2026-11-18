@@ -1,0 +1,267 @@
+//! Where Word's online export draws the glyphs of a line (probe 1 of
+//! `current_focus/fundamentals.md`, kit `tests/output/fundamentals/glyph_grid`).
+//!
+//! Layout keeps the exact font advances; only drawing moves. Word places each
+//! glyph on a 288 dpi device grid (1 px = 0.25pt) following the exact advances
+//! accumulated over the line, then its PDF writer rounds every advance to
+//! whole thousandths of an em with a bias that loses part of a unit per glyph,
+//! restarting at each run's text matrix. Together they leave a run's last
+//! words up to ~0.3pt left of their exact places.
+
+/// One glyph of a sequence of glyphs set edge to edge on a line.
+pub(super) struct GridGlyph {
+    /// Exact advance in points, `apart` included.
+    pub advance: f32,
+    /// Points Word rounds on their own before adding them to the glyph's
+    /// device advance: a justified space's share of the line's slack, letter
+    /// spacing, a kerning pair's adjustment on the plain path (probes 2, 4, 5).
+    pub apart: f32,
+    /// From kerned text set with `enableOpenTypeFeatures`, which Word lays
+    /// out through its shaping path: that one rounds the whole advance,
+    /// kerning included, half-up (probe 4).
+    pub shaped: bool,
+    pub font_size: f32,
+    /// Word's writer starts a new text matrix here (a new run).
+    pub run_start: bool,
+}
+
+const PX_PER_PT: f64 = 4.0;
+/// A device chunk restarts the pixel position at the rounded exact one; the
+/// probe pins the length at 1024 px (1000 or 1040 quadruple the misses).
+const CHUNK_PX: f64 = 1023.5;
+/// Word's text matrices sit 0.025pt right of the 0.25pt grid (36.025 for a
+/// 36pt margin, in every reference checked).
+const PHASE_PT: f64 = 0.025;
+
+/// A glyph's own device advance rounds up from 0.46 px, not 0.5: over the
+/// fixture references 236/512 px goes up and 235/512 down in every face and
+/// size (bar a few hinted glyphs), which halves the wrong advances.
+const ROUND_UP_FROM: f64 = 0.46;
+
+/// A glyph's device advance (px): its own width rounded up from 0.46 px plus
+/// `apart` rounded half-up on its own (Arial 10 justified space: 11.11 +
+/// 11.47 px draws 22 px, not 23; probe 2).
+fn device_advance(g: &GridGlyph) -> i64 {
+    let own = (g.advance - g.apart) as f64 * PX_PER_PT;
+    let apart = (g.apart as f64 * PX_PER_PT).round() as i64;
+    let up_from = if g.shaped { 0.5 } else { ROUND_UP_FROM };
+    own.floor() as i64 + i64::from(own.fract() >= up_from) + apart
+}
+
+/// Device advances (px) of glyphs whose exact origins are `ideal` (absolute
+/// px) and exact advances `exact` (px): each glyph keeps its device advance
+/// `base` unless the glyph after next would then land 2 px or more from its
+/// rounded exact place, measured from the chunk start; then it moves 1 px
+/// toward it.
+fn device_steps(ideal: &[f64], exact: &[f64], base: &[i64]) -> Vec<i64> {
+    let n = exact.len();
+    let ideal_end = ideal[n - 1] + exact[n - 1];
+    let mut starts = vec![false; n];
+    starts[0] = true;
+    let mut chunk0 = 0;
+    for j in 1..n {
+        if ideal[j] + exact[j] - ideal[chunk0] > CHUNK_PX {
+            starts[j] = true;
+            chunk0 = j;
+        }
+    }
+    let (mut pos, mut p0, mut i0) = (0i64, 0i64, 0.0f64);
+    let mut steps = Vec::with_capacity(n.saturating_sub(1));
+    for k in 0..n.saturating_sub(1) {
+        if starts[k] {
+            pos = ideal[k].round() as i64;
+            p0 = pos;
+            i0 = ideal[k];
+        }
+        let adv = if starts[k + 1] {
+            ideal[k + 1].round() as i64 - pos
+        } else {
+            let next2 = if k + 2 < n { ideal[k + 2] } else { ideal_end };
+            let placed = (pos - p0) + base[k] + base[k + 1];
+            let wanted = (next2 - i0).round() as i64;
+            if placed - wanted >= 2 {
+                base[k] - 1
+            } else if wanted - placed >= 2 {
+                base[k] + 1
+            } else {
+                base[k]
+            }
+        };
+        steps.push(adv);
+        pos += adv;
+    }
+    steps
+}
+
+/// The drawn x (points) of each glyph of a sequence whose exact origin is `x0`.
+pub(super) fn drawn_positions(x0: f32, glyphs: &[GridGlyph]) -> Vec<f32> {
+    if glyphs.is_empty() {
+        return Vec::new();
+    }
+    let exact: Vec<f64> = glyphs
+        .iter()
+        .map(|g| g.advance as f64 * PX_PER_PT)
+        .collect();
+    let mut ideal = Vec::with_capacity(exact.len());
+    let mut x = x0 as f64 * PX_PER_PT;
+    for w in &exact {
+        ideal.push(x);
+        x += w;
+    }
+    let base: Vec<i64> = glyphs.iter().map(device_advance).collect();
+    let steps = device_steps(&ideal, &exact, &base);
+    let mut device = ideal[0].round() as i64;
+    let mut drawn = Vec::with_capacity(glyphs.len());
+    let mut pen = 0.0f64;
+    for (k, g) in glyphs.iter().enumerate() {
+        if k == 0 || g.run_start {
+            pen = device as f64 / PX_PER_PT + PHASE_PT;
+        } else {
+            // The writer's TJ moves are whole units; for the advance before
+            // this glyph it writes W − adj with adj rounded half away from
+            // zero, one more when the device advance exceeds W.
+            let prev = &glyphs[k - 1];
+            let unit = prev.font_size as f64 / 1000.0;
+            let w = ((prev.advance - prev.apart) as f64 / unit).round();
+            let d = steps[k - 1] as f64 / PX_PER_PT / unit;
+            let gap = w - d;
+            let adj = if gap.abs() < 0.5 {
+                0.0
+            } else if gap > 0.0 {
+                gap.round()
+            } else {
+                gap.round() + 1.0
+            };
+            pen += (w - adj) * unit;
+        }
+        drawn.push(pen as f32);
+        if k + 1 < glyphs.len() {
+            device += steps[k];
+        }
+    }
+    drawn
+}
+
+/// Where Word draws a tab's leader (examples of `tab-leader-fill`): each
+/// glyph advances by its own device width, and the glyphs sit on the page's
+/// grid of that pitch counted from x = 0. Every slot that starts at or after
+/// the tab's start and ends by the tab's end (both device px) gets one, so
+/// the leader is flush with neither end of the gap.
+pub(super) fn leader_positions(advance: f32, start_px: i64, end_px: i64) -> Vec<f32> {
+    let pitch = device_advance(&GridGlyph {
+        advance,
+        apart: 0.0,
+        shaped: false,
+        font_size: 0.0,
+        run_start: false,
+    });
+    if pitch <= 0 {
+        return Vec::new();
+    }
+    let first = start_px.div_euclid(pitch) + i64::from(start_px.rem_euclid(pitch) != 0);
+    let last = end_px.div_euclid(pitch);
+    (first..last)
+        .map(|k| ((k * pitch) as f64 / PX_PER_PT + PHASE_PT) as f32)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(advances: &[f32], size: f32) -> Vec<GridGlyph> {
+        advances
+            .iter()
+            .map(|&advance| GridGlyph {
+                advance,
+                apart: 0.0,
+                shaped: false,
+                font_size: size,
+                run_start: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn steps_stay_within_a_pixel_of_the_exact_positions() {
+        // Times New Roman 12pt "e" (443.848 thousandths): 21.3 px each.
+        let w = 443.848 * 12.0 / 1000.0;
+        let g = run(&[w; 70], 12.0);
+        let exact: Vec<f64> = g.iter().map(|g| g.advance as f64 * 4.0).collect();
+        let ideal: Vec<f64> = (0..70).map(|k| 288.0 + k as f64 * exact[0]).collect();
+        let base: Vec<i64> = g.iter().map(device_advance).collect();
+        let steps = device_steps(&ideal, &exact, &base);
+        let mut pos = 288i64;
+        for (k, s) in steps.iter().enumerate() {
+            assert!((21..=22).contains(s));
+            pos += s;
+            assert!((pos as f64 - ideal[k + 1]).abs() < 1.5);
+        }
+    }
+
+    #[test]
+    fn a_stretched_space_rounds_its_stretch_apart() {
+        // Arial 10 space 11.113 px + 11.47 px of stretch: 11 + 11, not 23.
+        let space = GridGlyph {
+            advance: (11.113 + 11.47) / 4.0,
+            apart: 11.47 / 4.0,
+            shaped: false,
+            font_size: 10.0,
+            run_start: false,
+        };
+        assert_eq!(device_advance(&space), 22);
+    }
+
+    #[test]
+    fn shaped_text_rounds_half_up() {
+        // Cambria 11 "e": 21.463 px, 22 on the plain path, 21 when kerned.
+        let mut e = GridGlyph {
+            advance: 21.463 / 4.0,
+            apart: 0.0,
+            shaped: false,
+            font_size: 11.0,
+            run_start: false,
+        };
+        assert_eq!(device_advance(&e), 22);
+        e.shaped = true;
+        assert_eq!(device_advance(&e), 21);
+    }
+
+    #[test]
+    fn writer_loses_a_fraction_of_a_unit_per_glyph() {
+        // 21 px = 437.5 units against W = 444: the writer moves 7 back and
+        // draws 437, half a unit short of the device advance.
+        let w = 443.848 * 12.0 / 1000.0;
+        let drawn = drawn_positions(72.0, &run(&[w; 3], 12.0));
+        assert!((drawn[0] - 72.025).abs() < 1e-4);
+        assert!((drawn[1] - (72.025 + 0.437 * 12.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_run_start_returns_to_the_device_grid() {
+        let w = 443.848 * 12.0 / 1000.0;
+        let mut g = run(&[w; 40], 12.0);
+        g[20].run_start = true;
+        let drawn = drawn_positions(72.0, &g);
+        let on_grid = (drawn[20] as f64 - PHASE_PT) * 4.0;
+        assert!((on_grid - on_grid.round()).abs() < 1e-3);
+        assert!(drawn[19] < drawn[20]);
+    }
+
+    #[test]
+    fn leader_fills_the_page_grid_slots_inside_the_tab() {
+        // Arial 10 "_" (5.56pt) draws at a 22 px pitch: a signature line from
+        // the margin (283.6 px) to a stop at 214.9pt, 26 glyphs from 71.5pt.
+        let xs = leader_positions(5.5615, 284, 860);
+        assert_eq!(xs.len(), 26);
+        assert!((xs[0] - 71.525).abs() < 1e-4);
+        assert!((xs[25] - (71.525 + 25.0 * 5.5)).abs() < 1e-3);
+        // Arial 10 "." (11.12 px → 11): a slot starting on the tab start counts.
+        assert_eq!(leader_positions(2.78, 11 * 30, 11 * 31).len(), 1);
+        assert!(leader_positions(2.78, 11 * 30 + 1, 11 * 31).is_empty());
+        // A gap narrower than the glyph holds one when the rounded pitch fits:
+        // Arial 10 "_" from a 71.5pt margin to a stop 5.4pt on (308 px).
+        assert_eq!(leader_positions(5.5615, 286, 308), [71.525]);
+        assert!(leader_positions(5.5615, 286, 307).is_empty());
+    }
+}

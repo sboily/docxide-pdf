@@ -1,0 +1,339 @@
+use super::canvas::Content;
+
+use crate::model::{
+    Alignment, HorizontalRule, LineSpacing, Paragraph, ParagraphBorder, ParagraphBorders,
+};
+
+use super::color::fill_rgb;
+
+/// Points in whole twips, for comparisons Word makes in its own units: a
+/// 8616.99-twip picture fits an 8617-twip column, exactly half an em free
+/// pulls a word under compressPunctuation.
+pub(super) fn twips(pt: f32) -> f32 {
+    (pt * 20.0).round()
+}
+
+/// How far an object `slack` narrower than its box moves to follow the
+/// paragraph alignment: centred takes half of it, right-aligned all of it.
+pub(super) fn align_offset(alignment: Alignment, slack: f32) -> f32 {
+    match alignment {
+        Alignment::Center => slack / 2.0,
+        Alignment::Right => slack,
+        _ => 0.0,
+    }
+}
+
+/// Draw a VML horizontal rule (o:hr) on the line whose box ends at
+/// `line_bottom`, in a column starting at `col_x`, `col_w` wide. The width
+/// percentage and alignment apply inside the paragraph's indents (slovak's
+/// 60.9% rule is 291.7pt of 478.95, centred there), and the bar's bottom sits
+/// 2pt above the line bottom (croatian's 18pt and isla's 12pt lines both).
+pub(super) fn draw_horizontal_rule(
+    content: &mut Content,
+    para: &Paragraph,
+    hr: &HorizontalRule,
+    col_x: f32,
+    col_w: f32,
+    line_bottom: f32,
+) {
+    let area_w = (col_w - para.indent_left - para.indent_right).max(0.0);
+    let rule_w = area_w * hr.width_pct / 100.0;
+    let rule_x = col_x + para.indent_left + align_offset(para.alignment, area_w - rule_w);
+    // Standard HRs (o:hrstd) render as a thin 0.5pt line
+    let draw_h = if hr.is_standard { 0.5 } else { hr.height_pt };
+    content.save_state();
+    fill_rgb(content, hr.fill_color);
+    content.rect(rule_x, line_bottom + 2.0, rule_w, draw_h);
+    content.fill_nonzero();
+    content.restore_state();
+}
+
+/// Approximate a circle with 4 cubic Bézier curves (path only — caller fills/strokes).
+pub(super) fn draw_circle(content: &mut Content, cx: f32, cy: f32, r: f32) {
+    let k = r * 0.552_284_8;
+    content.move_to(cx + r, cy);
+    content.cubic_to(cx + r, cy + k, cx + k, cy + r, cx, cy + r);
+    content.cubic_to(cx - k, cy + r, cx - r, cy + k, cx - r, cy);
+    content.cubic_to(cx - r, cy - k, cx - k, cy - r, cx, cy - r);
+    content.cubic_to(cx + k, cy - r, cx + r, cy - k, cx + r, cy);
+    content.close_path();
+}
+
+pub(crate) fn resolve_line_h(ls: LineSpacing, font_size: f32, tallest_lhr: Option<f32>) -> f32 {
+    match ls {
+        LineSpacing::Auto(mult) => tallest_lhr
+            .map(|ratio| font_size * ratio * mult)
+            .unwrap_or(font_size * 1.2 * mult),
+        LineSpacing::Exact(pts) => pts,
+        LineSpacing::AtLeast(min_pts) => {
+            let natural = tallest_lhr
+                .map(|ratio| font_size * ratio)
+                .unwrap_or(font_size * 1.2);
+            natural.max(min_pts)
+        }
+    }
+}
+
+/// What line spacing adds to a font's natural line (`line_h` from
+/// `resolve_line_h`), never negative.
+pub(crate) fn spacing_leading(line_h: f32, font_size: f32, tallest_lhr: Option<f32>) -> f32 {
+    (line_h - font_size * tallest_lhr.unwrap_or(1.2)).max(0.0)
+}
+
+/// What line spacing adds below a picture taller than its line's text. An
+/// at-least minimum adds nothing: the picture line only grows to it, the
+/// picture at its foot (Word examples: a 26.2pt picture or inline text box
+/// under 15 and 24pt minimums keeps a 26.2pt line, under 40pt fills it,
+/// whatever the mark's size).
+pub(crate) fn picture_leading(ls: LineSpacing, font_size: f32, tallest_lhr: Option<f32>) -> f32 {
+    if matches!(ls, LineSpacing::AtLeast(_)) {
+        return 0.0;
+    }
+    spacing_leading(
+        resolve_line_h(ls, font_size, tallest_lhr),
+        font_size,
+        tallest_lhr,
+    )
+}
+
+/// How much of its ascent a line's first baseline sits below the line top.
+/// Below single spacing Word shrinks the whole line box, ascent and descent
+/// alike; at or above it the extra leading all goes below the baseline (Word
+/// probes: Times New Roman and Arial, 7-20pt lines at 0.8, 0.9, 1, 1.15, 1.5).
+pub(crate) fn auto_ascent_scale(ls: LineSpacing) -> f32 {
+    match ls {
+        LineSpacing::Auto(m) if m < 1.0 => m,
+        _ => 1.0,
+    }
+}
+
+/// The band a paragraph border adds to its box: its `space` and its lines.
+pub(super) fn border_band(border: Option<&ParagraphBorder>) -> f32 {
+    border.map_or(0.0, |b| b.space_pt + b.extent())
+}
+
+fn border_eq(a: &Option<ParagraphBorder>, b: &Option<ParagraphBorder>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.width_pt == b.width_pt && a.color == b.color && a.style == b.style,
+        _ => false,
+    }
+}
+
+/// The sides that decide whether two paragraphs share a border group; their
+/// `between` borders may differ (header-footer-border-groups).
+pub(super) fn borders_match(a: &ParagraphBorders, b: &ParagraphBorders) -> bool {
+    border_eq(&a.top, &b.top)
+        && border_eq(&a.bottom, &b.bottom)
+        && border_eq(&a.left, &b.left)
+        && border_eq(&a.right, &b.right)
+}
+
+/// Where a border group goes on from `para` to `next`, Word leaves the
+/// `space` of `next`'s `between` border, then draws `para`'s `between` border
+/// and its `space` (header-footer-border-groups). Returns the gap above that
+/// border and the whole band.
+pub(super) fn between_band(para: &Paragraph, next: &Paragraph) -> (f32, f32) {
+    let above = between_space(next);
+    (above, above + border_band(para.borders.between.as_ref()))
+}
+
+/// The `space` of `para`'s `between` border: the part of `between_band` below
+/// that border. Word fills it with the next paragraph's shading and the gap
+/// above the border with `para`'s, but never the border's own band: a double
+/// border's gap stays white (border-group-between-bands).
+pub(super) fn between_space(para: &Paragraph) -> f32 {
+    para.borders.between.as_ref().map_or(0.0, |b| b.space_pt)
+}
+
+/// The border drawn below `para` and its band (the gap above the border, the
+/// whole band): the `between` border and `between_band` when `next` goes on
+/// in its border group, else the bottom border, `space` above its stroke.
+pub(super) fn bottom_border<'a>(
+    para: &'a Paragraph,
+    next: Option<&Paragraph>,
+) -> (Option<&'a ParagraphBorder>, (f32, f32)) {
+    match next {
+        Some(n) => (para.borders.between.as_ref(), between_band(para, n)),
+        None => {
+            let b = para.borders.bottom.as_ref();
+            (
+                b,
+                b.map_or((0.0, 0.0), |b| (b.space_pt, border_band(Some(b)))),
+            )
+        }
+    }
+}
+
+/// §17.3.1.9: contextualSpacing drops a paragraph's spacing next to a paragraph
+/// of the same style (a Title line keeps it beside a Normal one).
+pub(super) fn drops_contextual_spacing(para: &Paragraph, neighbour: Option<&Paragraph>) -> bool {
+    para.contextual_spacing && neighbour.is_some_and(|n| n.style_id == para.style_id)
+}
+
+/// Word drops a list item's HTML auto spacing (`beforeAutospacing` /
+/// `afterAutospacing`) beside another item of the same list, as HTML
+/// collapses `<li>` margins: federal_design_services' ten 9pt items step
+/// 10.25, not 24.3, while the first keeps 14pt above and the last 14pt below.
+fn same_list(para: &Paragraph, neighbour: Option<&Paragraph>) -> bool {
+    para.list_item
+        .zip(neighbour.and_then(|n| n.list_item))
+        .is_some_and(|(a, b)| a.list_id == b.list_id)
+}
+
+fn drops_space_before(para: &Paragraph, prev: Option<&Paragraph>) -> bool {
+    drops_contextual_spacing(para, prev) || (para.space_before_auto && same_list(para, prev))
+}
+
+pub(super) fn drops_space_after(para: &Paragraph, next: Option<&Paragraph>) -> bool {
+    drops_contextual_spacing(para, next) || (para.space_after_auto && same_list(para, next))
+}
+
+/// `space_before` unless contextual or list auto spacing drops it beside `prev`.
+pub(super) fn effective_space_before(para: &Paragraph, prev: Option<&Paragraph>) -> f32 {
+    if drops_space_before(para, prev) {
+        0.0
+    } else {
+        para.space_before
+    }
+}
+
+/// `space_after` unless contextual or list auto spacing drops it beside `next`.
+pub(super) fn effective_space_after(para: &Paragraph, next: Option<&Paragraph>) -> f32 {
+    if drops_space_after(para, next) {
+        0.0
+    } else {
+        para.space_after
+    }
+}
+
+/// Word merges adjacent paragraphs with identical borders into one box when
+/// their boxes line up: a box edge differing by a few twips starts a new group
+/// with its own top/bottom rule, but the indents themselves may differ —
+/// clean_energy_regulator_act's bullets (left 1559tw, hanging 425) and
+/// sub-paragraphs (2070, 936) both start at 1134tw and share one box.
+pub(super) fn joins_border_group(a: &Paragraph, b: &Paragraph) -> bool {
+    let same = |x: f32, y: f32| (x - y).abs() < 0.01;
+    let (al, ar) = border_box_indents(a);
+    let (bl, br) = border_box_indents(b);
+    borders_match(&a.borders, &b.borders) && same(al, bl) && same(ar, br)
+}
+
+/// How far a paragraph's border and shading box sits inside the column on
+/// the left and on the right: Word boxes the indented text, from the start
+/// indent or the first line when that hangs further out, to the end indent
+/// (paragraph-border-indents).
+pub(super) fn border_box_indents(p: &Paragraph) -> (f32, f32) {
+    let hang = (p.indent_first_line - p.indent_hanging).min(0.0);
+    if p.bidi {
+        (p.indent_left, p.indent_right + hang)
+    } else {
+        (p.indent_left + hang, p.indent_right)
+    }
+}
+
+/// The paragraph and the paragraphs of its textboxes (and their tables), at
+/// any depth.
+pub(super) fn collect_paras(para: &Paragraph) -> Vec<&Paragraph> {
+    let mut out = vec![para];
+    for tb in &para.textboxes {
+        for tp in tb.content().iter().chain(tb.table_paragraphs()) {
+            out.extend(collect_paras(tp));
+        }
+    }
+    out
+}
+
+/// How far outside its `space` a paragraph's left or right border sits.
+const LEFT_BORDER_GAP: f32 = 1.47;
+const RIGHT_BORDER_GAP: f32 = 1.73;
+
+/// How far a top or bottom border runs past its box at each side: to a side
+/// border's outer edge, or without one by the side gaps Word keeps anyway
+/// (paragraph-border-styles: 70.5–541.7 on a 72–540 measure).
+pub(super) fn horizontal_border_ext(borders: &crate::model::ParagraphBorders) -> (f32, f32) {
+    let ext = |b: &Option<ParagraphBorder>, gap: f32| b.as_ref().map_or(gap, |b| b.extent() / 2.0);
+    (
+        ext(&borders.left, LEFT_BORDER_GAP),
+        ext(&borders.right, RIGHT_BORDER_GAP),
+    )
+}
+
+/// How far outside the text the left and right borders' inner edges sit
+/// (`space` plus the gap), or their stroke centres with `to_centre`.
+pub(super) fn side_border_outsets(
+    borders: &crate::model::ParagraphBorders,
+    to_centre: bool,
+) -> (f32, f32) {
+    let outset = |b: Option<&crate::model::ParagraphBorder>, gap: f32| {
+        b.map_or(0.0, |b| {
+            b.space_pt + gap + if to_centre { b.extent() / 2.0 } else { 0.0 }
+        })
+    };
+    (
+        outset(borders.left.as_ref(), LEFT_BORDER_GAP),
+        outset(borders.right.as_ref(), RIGHT_BORDER_GAP),
+    )
+}
+
+/// How far paragraph shading reaches outside the text box: to a side
+/// border's inner edge, or by the side gaps when there is none
+/// (renewable_dispatch: borderless bars at 70.525–541.725 on a 72–540
+/// measure, and 1.475pt / 1.725pt outside a cell's text).
+pub(super) fn shading_outsets(borders: &crate::model::ParagraphBorders) -> (f32, f32) {
+    let (left, right) = side_border_outsets(borders, false);
+    (
+        if borders.left.is_some() {
+            left
+        } else {
+            LEFT_BORDER_GAP
+        },
+        if borders.right.is_some() {
+            right
+        } else {
+            RIGHT_BORDER_GAP
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bordered(indent_left: f32) -> Paragraph {
+        Paragraph {
+            indent_left,
+            borders: ParagraphBorders {
+                bottom: Some(ParagraphBorder {
+                    width_pt: 2.25,
+                    space_pt: 1.0,
+                    color: [166, 166, 166],
+                    style: crate::model::BorderStyle::Single,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn identical_borders_join_only_with_identical_indents() {
+        // samtale: a br-only spacer and the "Medarbeiderens navn" line share a
+        // bottom rule and indent, so only the group's last rule is drawn.
+        assert!(joins_border_group(&bordered(0.0), &bordered(0.0)));
+        // samtale survey items 12/13: numbering ind 1131tw vs direct ind 1128tw
+        // — Word keeps a rule under each.
+        assert!(!joins_border_group(&bordered(56.55), &bordered(56.4)));
+        let mut other = bordered(0.0);
+        other.borders.bottom.as_mut().unwrap().color = [0, 0, 0];
+        assert!(!joins_border_group(&bordered(0.0), &other));
+        let hanging = |left: f32, hanging: f32| Paragraph {
+            indent_hanging: hanging,
+            ..bordered(left)
+        };
+        assert!(joins_border_group(
+            &hanging(77.95, 21.25),
+            &hanging(103.5, 46.8)
+        ));
+    }
+}

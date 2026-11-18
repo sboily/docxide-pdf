@@ -1,0 +1,513 @@
+use std::collections::HashMap;
+use std::ops::Range;
+
+use super::canvas::Content;
+
+use crate::model::{Footnote, LineSpacing, Paragraph, Run};
+
+use super::RenderContext;
+use super::color::stroke_segment;
+use super::helpers::{effective_space_after, effective_space_before};
+use super::layout::{
+    LineOpts, LinkTagger, RenderOpts, TextLine, boxed_line_ascent, build_lines,
+    inline_line_advance, is_text_empty, lines_height, os2_strike, render_paragraph_lines,
+    size_lines_by_own_runs, tallest_run_metrics,
+};
+use super::list_label::render_list_label;
+use super::resolve_line_h;
+use super::tagging::NoteTagger;
+
+/// Destination name a note's reference mark links to. Word bookmark names
+/// can't contain spaces, so it never collides with a real bookmark.
+pub(super) fn note_anchor(endnote: bool, id: u32) -> String {
+    format!("{} {id}", if endnote { "endnote" } else { "footnote" })
+}
+
+fn substitute_ref_marks(runs: &[Run], display_num: &str) -> Vec<Run> {
+    runs.iter()
+        .map(|run| {
+            if run.is_footnote_ref_mark || run.is_endnote_ref_mark {
+                let mut r = run.clone();
+                r.text = display_num.to_string();
+                r
+            } else {
+                run.clone()
+            }
+        })
+        .collect()
+}
+
+struct ParagraphLayout {
+    font_size: f32,
+    line_height: f32,
+    /// The first baseline below the paragraph's top.
+    ascent: f32,
+    /// How far a tall list label lowers the first baseline (in `ascent`).
+    label_boost: f32,
+    lines: Vec<TextLine>,
+}
+
+impl ParagraphLayout {
+    fn height(&self) -> f32 {
+        lines_height(&self.lines, self.line_height, (self.ascent, 0.0)) + self.label_boost
+    }
+}
+
+/// `runs` are `para`'s with the reference mark filled in; a tab goes to
+/// the paragraph's stops as in the body (uk_commercial_lease's notes tab to
+/// their 567-twip stop on the mark's line).
+fn layout_paragraph(
+    runs: &[Run],
+    para: &Paragraph,
+    line_spacing: LineSpacing,
+    ctx: &RenderContext,
+    text_width: f32,
+    first_line_hanging: f32,
+) -> Option<ParagraphLayout> {
+    if is_text_empty(runs) {
+        return None;
+    }
+    let (fs, tallest_lhr, tallest_ar) = tallest_run_metrics(runs, ctx.fonts);
+    let lh = resolve_line_h(line_spacing, fs, tallest_lhr);
+    let mut lines = build_lines(
+        runs,
+        ctx,
+        text_width,
+        ctx.cjk(true, para),
+        &LineOpts {
+            tab_stops: &para.tab_stops,
+            indent_left: para.indent_left,
+            indent_right: para.indent_right,
+            hanging: first_line_hanging,
+            ..Default::default()
+        },
+    );
+    // Each line as tall as its own runs, as in the body: a note's larger
+    // reference mark raises only its own line (uk_commercial_lease: 10pt
+    // marks over 8pt text, the following lines step 9.5 in Word).
+    let ascender_ratio = tallest_ar.unwrap_or(0.75);
+    if !matches!(line_spacing, LineSpacing::Exact(_)) {
+        size_lines_by_own_runs(
+            &mut lines,
+            ctx.fonts,
+            line_spacing,
+            lh,
+            fs * ascender_ratio,
+            1.0,
+            para.text_alignment,
+        );
+        super::size_tab_mark_line(&mut lines, para, line_spacing, tallest_lhr, ctx.fonts);
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    // Exact and tall at-least lines sit in their box as in the body (an exact
+    // line's baseline 0.8 down it), not at the font's ascent.
+    let ascent = boxed_line_ascent(
+        line_spacing,
+        lh,
+        fs,
+        tallest_lhr,
+        tallest_ar,
+        runs,
+        ctx.fonts,
+    )
+    .unwrap_or(fs * ascender_ratio);
+    // A bullet taller than the text raises the first line as in the body
+    // (uk_commercial_lease's note 16 bullets step 9.75 over 8pt Arial's 9.2).
+    let boost = super::label_boosted_line_h(
+        para,
+        ctx.fonts,
+        lh,
+        line_spacing,
+        fs,
+        tallest_lhr,
+        tallest_ar,
+    ) - lh;
+    let label_boost = boost.max(0.0);
+    let ascent = ascent + label_boost;
+    Some(ParagraphLayout {
+        font_size: fs,
+        line_height: lh,
+        ascent,
+        label_boost,
+        lines,
+    })
+}
+
+/// Word keeps one line for an empty paragraph, sized by its paragraph mark —
+/// the synthetic run the parser leaves in an empty paragraph carries that font.
+fn empty_paragraph_line_h(para: &Paragraph, ls: LineSpacing, ctx: &RenderContext) -> f32 {
+    let (fs, lhr, _) = tallest_run_metrics(&para.runs, ctx.fonts);
+    resolve_line_h(ls, fs, lhr)
+}
+
+/// Footnote `id` laid out as `render_page_footnotes` draws it, the note's
+/// mark included (a mark larger than the text raises its line); 0 if missing.
+pub(super) fn footnote_height(
+    id: u32,
+    footnotes: &HashMap<u32, Footnote>,
+    ctx: &RenderContext,
+    text_width: f32,
+) -> f32 {
+    footnote_line_heights(id, footnotes, ctx, text_width)
+        .iter()
+        .sum()
+}
+
+/// The note lines a page shows: all of a note, or the head or tail of one
+/// Word split across pages.
+pub(super) const WHOLE_NOTE: Range<usize> = 0..usize::MAX;
+
+/// What each line of footnote `id` adds to the footnote area: a paragraph's
+/// first line carries the spacing above it, the last line the note's
+/// trailing space after.
+pub(super) fn footnote_line_heights(
+    id: u32,
+    footnotes: &HashMap<u32, Footnote>,
+    ctx: &RenderContext,
+    text_width: f32,
+) -> Vec<f32> {
+    let Some(footnote) = footnotes.get(&id) else {
+        return Vec::new();
+    };
+    let mark = ctx.footnote_marks.get(&id).map_or("1", String::as_str);
+    let (paras, trailing) = note_paragraphs(footnote, mark, ctx, text_width);
+    let mut heights = Vec::new();
+    for np in &paras {
+        match &np.layout {
+            Some(l) => heights.extend(l.lines.iter().enumerate().map(|(i, line)| {
+                let advance = inline_line_advance(line, l.line_height, (l.ascent, 0.0));
+                if i == 0 {
+                    advance + np.gap_above + l.label_boost
+                } else {
+                    advance
+                }
+            })),
+            None => heights.push(np.gap_above + np.height),
+        }
+    }
+    // Word puts a note's last space-after before the next note (erasmus_plus
+    // endnotes 5pt, master_thesis footnotes 3pt). ponytail: the last note is
+    // charged too, so a bottom-anchored block ends that far above the margin;
+    // the next note's space-before is untested.
+    if let Some(last) = heights.last_mut() {
+        *last += trailing;
+    }
+    heights
+}
+
+fn part_height(heights: &[f32], part: &Range<usize>) -> f32 {
+    let end = part.end.min(heights.len());
+    heights[part.start.min(end)..end].iter().sum()
+}
+
+/// A note's paragraph as both the height pass and the renderer see it.
+struct NotePara<'a> {
+    para: &'a Paragraph,
+    /// The spacing above it within the note (none before the first).
+    gap_above: f32,
+    text_width: f32,
+    hanging: f32,
+    /// None: an empty paragraph, one line of its mark's font.
+    layout: Option<ParagraphLayout>,
+    height: f32,
+}
+
+/// `footnote`'s paragraphs laid out at `text_width` with `mark` as the
+/// reference mark (a vanished empty paragraph takes no room), and the note's
+/// trailing space after.
+fn note_paragraphs<'a>(
+    footnote: &'a Footnote,
+    mark: &str,
+    ctx: &RenderContext,
+    text_width: f32,
+) -> (Vec<NotePara<'a>>, f32) {
+    let mut paras = Vec::new();
+    let mut prev_space_after = 0.0f32;
+    let mut prev_para = None;
+    for (i, para) in footnote.paragraphs.iter().enumerate() {
+        let ls = para.line_spacing.unwrap_or(ctx.doc_line_spacing);
+        let para_text_width = (text_width - para.indent_left - para.indent_right).max(1.0);
+        let hanging = super::list_label::text_hanging(para, 0.0, ctx.fonts);
+        let runs = substitute_ref_marks(&para.runs, mark);
+        let layout = layout_paragraph(&runs, para, ls, ctx, para_text_width, hanging);
+        if layout.is_none() && para.paragraph_mark_vanish {
+            continue;
+        }
+        let gap_above = if i > 0 {
+            f32::max(prev_space_after, effective_space_before(para, prev_para))
+        } else {
+            0.0
+        };
+        let height = layout.as_ref().map_or_else(
+            || empty_paragraph_line_h(para, ls, ctx),
+            ParagraphLayout::height,
+        );
+        paras.push(NotePara {
+            para,
+            gap_above,
+            text_width: para_text_width,
+            hanging,
+            layout,
+            height,
+        });
+        prev_space_after = effective_space_after(para, footnote.paragraphs.get(i + 1));
+        prev_para = Some(para);
+    }
+    (paras, prev_space_after)
+}
+
+/// The separator above a page's footnotes, laid out as Word lays out
+/// footnotes.xml's separator paragraph (Word probes: Calibri 6-20pt; single,
+/// double and exact lines; space before and after): one line of its font and
+/// spacing with its space after below, right on the first note, and the rule
+/// that line's strikethrough, 144pt long. Space before goes nowhere.
+pub(crate) struct NoteSeparator {
+    pub(super) height: f32,
+    /// The rule's centre below the separator's top, and its thickness.
+    rule: (f32, f32),
+}
+
+impl NoteSeparator {
+    pub(super) fn new(
+        separator: Option<&Paragraph>,
+        fonts: &HashMap<String, crate::fonts::FontEntry>,
+        doc_line_spacing: LineSpacing,
+    ) -> Self {
+        let Some(p) = separator else {
+            return Self {
+                height: 12.0,
+                rule: (3.0, 0.5),
+            };
+        };
+        let ls = p.line_spacing.unwrap_or(doc_line_spacing);
+        let (fs, lhr, ar) = tallest_run_metrics(&p.runs, fonts);
+        let line_h = resolve_line_h(ls, fs, lhr);
+        let baseline = boxed_line_ascent(ls, line_h, fs, lhr, ar, &p.runs, fonts)
+            .unwrap_or(fs * ar.unwrap_or(0.8));
+        let (top, thickness) = p
+            .runs
+            .first()
+            .and_then(|r| fonts.get(&crate::fonts::font_key(r)))
+            .and_then(|e| os2_strike(e, fs))
+            .unwrap_or((fs * 0.25, 0.5));
+        Self {
+            height: line_h + p.space_after,
+            rule: (baseline - top + thickness / 2.0, thickness),
+        }
+    }
+}
+
+pub(super) fn render_page_footnotes(
+    content: &mut Content,
+    fn_ids: &[(u32, Range<usize>)],
+    footnotes: &HashMap<u32, Footnote>,
+    footnote_display_order: &HashMap<u32, String>,
+    ctx: &RenderContext,
+    margin_left: f32,
+    margin_bottom: f32,
+    text_width: f32,
+    gradient_specs: &mut Vec<super::GradientSpec>,
+    notes: NoteTagger<'_>,
+) -> Vec<(u32, f32)> {
+    if fn_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let total_fn_height: f32 = fn_ids
+        .iter()
+        .map(|(id, part)| {
+            part_height(
+                &footnote_line_heights(*id, footnotes, ctx, text_width),
+                part,
+            )
+        })
+        .sum();
+
+    let fn_y = margin_bottom + total_fn_height;
+    let separator = &ctx.note_separator;
+    let (rule_centre, thickness) = separator.rule;
+    let sep_y = fn_y + separator.height - rule_centre;
+    draw_note_separator(content, margin_left, sep_y, text_width, thickness);
+
+    render_notes_downward(
+        content,
+        fn_y,
+        fn_ids,
+        footnotes,
+        footnote_display_order,
+        ctx,
+        margin_left,
+        text_width,
+        gradient_specs,
+        notes,
+    )
+}
+
+fn draw_note_separator(
+    content: &mut Content,
+    margin_left: f32,
+    sep_y: f32,
+    text_width: f32,
+    thickness: f32,
+) {
+    // Black rule, ~1/3 page width — matches Word's footnote/endnote separator
+    let sep_width = 144.0f32.min(text_width);
+    stroke_segment(
+        content,
+        (margin_left, sep_y),
+        (margin_left + sep_width, sep_y),
+        thickness,
+        None,
+    );
+}
+
+/// Endnotes default to `pos=docEnd`: Word flows them in the normal content
+/// stream right after the last body block (NOT pinned to the page bottom like
+/// footnotes). `top_y` is the body cursor below the last block.
+/// ponytail: single-page flow only — endnotes that overflow the bottom margin
+/// are not paginated to a new page; add when a fixture needs it.
+pub(super) fn render_endnotes_inline(
+    content: &mut Content,
+    top_y: f32,
+    en_ids: &[u32],
+    endnotes: &HashMap<u32, Footnote>,
+    endnote_display_order: &HashMap<u32, String>,
+    ctx: &RenderContext,
+    margin_left: f32,
+    text_width: f32,
+    gradient_specs: &mut Vec<super::GradientSpec>,
+    notes: NoteTagger<'_>,
+) -> Vec<(u32, f32)> {
+    if en_ids.is_empty() {
+        return Vec::new();
+    }
+    // endnotes.xml's separator paragraph, laid out as the footnote one
+    // (case75: Word's rule 20.8pt below the last body baseline, the first
+    // note 13.5pt below the rule).
+    let separator = &ctx.endnote_separator;
+    let (rule_centre, thickness) = separator.rule;
+    draw_note_separator(
+        content,
+        margin_left,
+        top_y - rule_centre,
+        text_width,
+        thickness,
+    );
+    let fn_y = top_y - separator.height;
+    let en_ids: Vec<(u32, Range<usize>)> = en_ids.iter().map(|&id| (id, WHOLE_NOTE)).collect();
+    render_notes_downward(
+        content,
+        fn_y,
+        &en_ids,
+        endnotes,
+        endnote_display_order,
+        ctx,
+        margin_left,
+        text_width,
+        gradient_specs,
+        notes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_notes_downward(
+    content: &mut Content,
+    mut fn_y: f32,
+    fn_ids: &[(u32, Range<usize>)],
+    footnotes: &HashMap<u32, Footnote>,
+    footnote_display_order: &HashMap<u32, String>,
+    ctx: &RenderContext,
+    margin_left: f32,
+    text_width: f32,
+    gradient_specs: &mut Vec<super::GradientSpec>,
+    notes: NoteTagger<'_>,
+) -> Vec<(u32, f32)> {
+    // Top of each note drawn, for the link from its reference mark.
+    let mut tops = Vec::new();
+    for (fn_id, part) in fn_ids {
+        let Some(footnote) = footnotes.get(fn_id) else {
+            continue;
+        };
+        if part.start == 0 {
+            tops.push((*fn_id, fn_y));
+        }
+        let note = notes.tags.note(notes.endnote, *fn_id, super::tagging::ROOT);
+        let display_num = footnote_display_order
+            .get(fn_id)
+            .cloned()
+            .unwrap_or_else(|| "1".to_string());
+
+        let (paras, trailing) = note_paragraphs(footnote, &display_num, ctx, text_width);
+        // `line` counts the note's lines, to draw only those of `part`.
+        let mut line = 0;
+        for np in &paras {
+            let n = np.layout.as_ref().map_or(1, |l| l.lines.len());
+            let first = line;
+            line += n;
+            let (lo, hi) = (part.start.max(first), part.end.min(line));
+            if lo >= hi {
+                continue;
+            }
+            let (from, to) = (lo - first, hi - first);
+            let para = np.para;
+            let para_text_x = margin_left + para.indent_left;
+            if from == 0 {
+                // Inter-paragraph spacing within the footnote
+                fn_y -= np.gap_above;
+            }
+
+            let Some(layout) = &np.layout else {
+                fn_y -= np.height;
+                continue;
+            };
+            let label_boost = if from == 0 { layout.label_boost } else { 0.0 };
+            let baseline_y = fn_y - (layout.ascent - layout.label_boost + label_boost);
+            let lines = &layout.lines[from..to];
+
+            let p = notes.tags.add(note, "P");
+            notes.tags.begin(content, notes.page, p);
+            if from == 0 {
+                render_list_label(
+                    content,
+                    para,
+                    ctx.fonts,
+                    para_text_x - para.indent_hanging,
+                    baseline_y,
+                    layout.font_size,
+                );
+            }
+
+            render_paragraph_lines(
+                content,
+                lines,
+                &para.alignment,
+                para_text_x,
+                para.indent_left,
+                np.text_width,
+                baseline_y,
+                layout.line_height,
+                // Footnote lines carry no inline pictures, so no descent is needed.
+                (layout.ascent, 0.0),
+                layout.lines.len(),
+                notes.links,
+                np.hanging,
+                ctx.fonts,
+                gradient_specs,
+                RenderOpts {
+                    first_line_index: from,
+                    link_tags: Some(LinkTagger::new(notes.tags, notes.page, p)),
+                    ..Default::default()
+                },
+            );
+            super::tagging::Tags::end(content);
+            fn_y -= lines_height(lines, layout.line_height, (layout.ascent, 0.0)) + label_boost;
+        }
+        // The note's trailing space, as `footnote_line_heights` charges it.
+        if part.end >= line {
+            fn_y -= trailing;
+        }
+    }
+    tops
+}

@@ -1,0 +1,1495 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::fonts::FontEntry;
+
+use super::canvas::{self, Content};
+use crate::display::{Image, ImageColorSpace, ImageFilter};
+use pdf_writer::{Filter, Name, Pdf, Rect, Ref};
+
+use crate::model::{
+    Block, Document, EmbeddedImage, HeaderFooter, ImageFormat, ImageShadow, Paragraph,
+    SectionProperties, Table, Textbox,
+};
+
+/// Per-image effect XObject names (shadow, glow, inner shadow, reflection).
+/// Soft edge has no XObject — it modifies the image's own SMask.
+#[derive(Default, Clone)]
+pub(crate) struct EffectXObjs {
+    pub shadow: Option<String>,
+    pub glow: Option<String>,
+    pub inner_shadow: Option<String>,
+    pub reflection: Option<String>,
+}
+
+impl EffectXObjs {
+    fn has_any(&self) -> bool {
+        self.shadow.is_some()
+            || self.glow.is_some()
+            || self.inner_shadow.is_some()
+            || self.reflection.is_some()
+    }
+}
+
+pub(super) struct EmbeddedImages {
+    pub(super) image_pdf_names: HashMap<usize, String>,
+    pub(super) inline_image_pdf_names: HashMap<(usize, usize), String>,
+    pub(super) floating_image_pdf_names: HashMap<(usize, usize), String>,
+    pub(super) image_xobjects: Vec<(String, Ref)>,
+    pub(super) hf_image_names: HashMap<(usize, u8, usize), String>,
+    pub(super) hf_inline_image_names: HashMap<(usize, u8, usize, usize), String>,
+    pub(super) hf_floating_image_names: HashMap<(usize, u8, usize, usize), String>,
+    /// Images in table cell paragraphs, keyed by `EmbeddedImage::id`.
+    pub(super) table_cell_image_names: HashMap<usize, String>,
+    /// Images in textbox paragraphs (any depth), keyed by `EmbeddedImage::id`.
+    pub(super) textbox_image_names: HashMap<usize, String>,
+    /// SmartArt image fills, keyed by `EmbeddedImage::id`.
+    pub(super) smartart_image_names: HashMap<usize, String>,
+    // Effect XObject names (parallel to image name maps)
+    pub(super) effect_names: HashMap<usize, EffectXObjs>,
+    pub(super) effect_floating_names: HashMap<(usize, usize), EffectXObjs>,
+    pub(super) effect_inline_names: HashMap<(usize, usize), EffectXObjs>,
+    pub(super) effect_hf_names: HashMap<(usize, u8, usize), EffectXObjs>,
+    pub(super) effect_table_names: HashMap<usize, EffectXObjs>,
+}
+
+#[derive(Default)]
+struct ImageXObjects {
+    named: Vec<(String, Ref)>,
+    shared: HashMap<ImageKey, Ref>,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct ImageKey {
+    data: Arc<Vec<u8>>,
+    target: Option<(u32, u32)>,
+    soft_edge: Option<(u32, u32)>,
+    lum: Option<(u32, u32)>,
+    recolor: Option<([u8; 3], [u8; 3])>,
+    alpha: Option<u32>,
+}
+
+impl ImageKey {
+    fn new(
+        img: &EmbeddedImage,
+        (display_width, display_height): (f32, f32),
+        resample: bool,
+    ) -> Self {
+        Self {
+            data: Arc::clone(&img.data),
+            target: downscale_target(
+                img.pixel_width,
+                img.pixel_height,
+                display_width,
+                display_height,
+            )
+            .filter(|_| resample),
+            soft_edge: img
+                .soft_edge
+                .as_ref()
+                .map(|se| (se.radius.to_bits(), display_width.to_bits())),
+            lum: img.lum.map(|(b, c)| (b.to_bits(), c.to_bits())),
+            recolor: img.recolor,
+            alpha: img.alpha.map(f32::to_bits),
+        }
+    }
+}
+
+// Word's online export resamples any picture shown above ~192 ppi down to
+// 192 ppi (measured over the fixture references: 88 of 100 resampled images
+// land at 189–192 ppi, the largest kept one is at 184; case27's 1800×1200
+// photo becomes 479×320). A desktop export with picture compression off keeps
+// the source pixels instead, which is where "never downsample" came from.
+// `ConvertOptions::resample_pictures(false)` (CLI `--no-resample`,
+// `DOCXIDE_NO_RESAMPLE=1`) selects that desktop behaviour (issue #138).
+const DOWNSAMPLE_DPI_THRESHOLD: f32 = 192.0;
+const DOWNSAMPLE_DPI_TARGET: f32 = 192.0;
+// Word's online export writes every JPEG at libjpeg quality 75 (all 30 across
+// six references); at 85 our files outgrew Word's once re-encoding became
+// unconditional.
+const JPEG_QUALITY: u8 = 75;
+
+/// If pixel dimensions far exceed what's needed at the display size, return
+/// target pixel dimensions for downscaling. Returns `None` if no downscaling needed.
+fn downscale_target(
+    pixel_w: u32,
+    pixel_h: u32,
+    display_w: f32,
+    display_h: f32,
+) -> Option<(u32, u32)> {
+    if display_w <= 0.0 || display_h <= 0.0 {
+        return None;
+    }
+    let eff_dpi_x = pixel_w as f32 / (display_w / 72.0);
+    let eff_dpi_y = pixel_h as f32 / (display_h / 72.0);
+    let eff_dpi = eff_dpi_x.max(eff_dpi_y);
+
+    if eff_dpi <= DOWNSAMPLE_DPI_THRESHOLD {
+        return None;
+    }
+
+    let target_w = ((display_w / 72.0) * DOWNSAMPLE_DPI_TARGET).round() as u32;
+    let target_h = ((display_h / 72.0) * DOWNSAMPLE_DPI_TARGET).round() as u32;
+
+    if target_w >= pixel_w || target_h >= pixel_h || target_w < 4 || target_h < 4 {
+        return None;
+    }
+
+    Some((target_w, target_h))
+}
+
+/// Office picture brightness/contrast (`a:lum`, fractions of ±1.0) on 8-bit
+/// samples: contrast scales about mid-grey, brightness offsets, then clamp. Same
+/// mapping LibreOffice uses for its DrawingML import; Word's exact curve is
+/// undocumented, but this reproduces the washed-out stamp on
+/// italian_evaluation_minutes p7 (annotation #229).
+pub(super) fn apply_lum(samples: &mut [u8], bright: f32, contrast: f32) {
+    let c = contrast.clamp(-1.0, 1.0) * 127.0;
+    let scale = if c >= 0.0 {
+        128.0 / (128.0 - c)
+    } else {
+        (128.0 + c) / 128.0
+    };
+    let offset = bright.clamp(-1.0, 1.0) * 255.0;
+    let lut: [u8; 256] = std::array::from_fn(|v| {
+        ((v as f32 - 128.0) * scale + 128.0 + offset)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    });
+    for s in samples {
+        *s = lut[*s as usize];
+    }
+}
+
+/// A picture's `lum` and `recolor` on packed RGB samples: the duotone maps
+/// each pixel's luminance to a point on the ramp between its two colours.
+fn apply_blip_colors(img: &EmbeddedImage, rgb: &mut [u8]) {
+    if let Some((bright, contrast)) = img.lum {
+        apply_lum(rgb, bright, contrast);
+    }
+    let Some((dark, light)) = img.recolor else {
+        return;
+    };
+    let ramp: [[u8; 3]; 256] = std::array::from_fn(|l| {
+        std::array::from_fn(|i| {
+            (dark[i] as f32 + (light[i] as f32 - dark[i] as f32) * l as f32 / 255.0).round() as u8
+        })
+    });
+    for px in rgb.chunks_exact_mut(3) {
+        let luma = (299 * px[0] as u32 + 587 * px[1] as u32 + 114 * px[2] as u32 + 500) / 1000;
+        px.copy_from_slice(&ramp[luma as usize]);
+    }
+}
+
+/// Encode an RGB image as JPEG, returning the bytes. Returns `None` on failure.
+fn encode_jpeg(rgb: &image::RgbImage) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, JPEG_QUALITY);
+    match encoder.encode_image(rgb) {
+        Ok(()) => Some(buf),
+        Err(e) => {
+            log::warn!("JPEG encode failed: {e}");
+            None
+        }
+    }
+}
+
+/// A PNG or BMP stored at 1 bit per pixel. Word keeps the stored depth: such a
+/// source stays 1 bit per sample, while an 8-bit RGB source drawn in black and
+/// white only stays RGB (french_sexual_health's 132×132 icon).
+fn stored_one_bit(data: &[u8]) -> bool {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return data.get(24) == Some(&1);
+    }
+    if data.starts_with(b"BM") && data.len() >= 30 {
+        // Bit count sits after the 14-byte file header and the info header's
+        // size, width and height fields (BITMAPCOREHEADER packs them shorter).
+        let core = u32::from_le_bytes([data[14], data[15], data[16], data[17]]) == 12;
+        let at = if core { 24 } else { 28 };
+        return u16::from_le_bytes([data[at], data[at + 1]]) == 1;
+    }
+    false
+}
+
+/// Every pixel pure black or pure white and opaque: the only content a 1-bit
+/// gray sample can carry (a two-colour palette may hold other colours).
+fn is_bilevel(img: &image::DynamicImage) -> bool {
+    use image::GenericImageView;
+    img.pixels()
+        .all(|(_, _, p)| p[3] == 255 && p[0] == p[1] && p[1] == p[2] && (p[0] == 0 || p[0] == 255))
+}
+
+/// Pack RGB samples into 1-bit DeviceGray rows (MSB first, rows byte-aligned),
+/// thresholding resampled greys back to black and white.
+fn pack_bilevel(rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let stride = (w as usize).div_ceil(8);
+    let mut out = vec![0u8; stride * h as usize];
+    for (i, px) in rgb.chunks_exact(3).enumerate() {
+        if px[0] >= 128 {
+            let (x, y) = (i % w as usize, i / w as usize);
+            out[y * stride + x / 8] |= 0x80 >> (x % 8);
+        }
+    }
+    out
+}
+
+/// Fallback PNG decoder using the `png` crate directly. The `image` crate's
+/// format-pinned reader can fail on interlaced or unusual PNGs; this handles
+/// those cases by decoding to 8-bit gray or color.
+///
+/// A non-interlaced PNG whose image data ends early keeps the rows that
+/// decode, and the rest of the image stays zero (black, or transparent with
+/// alpha), as in Word.
+fn decode_png_raw(data: &[u8]) -> Option<image::DynamicImage> {
+    use image::{DynamicImage, ImageBuffer};
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().ok()?;
+    let (w, h) = (reader.info().width, reader.info().height);
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let decoded = reader.next_frame(&mut buf);
+    if reader.info().interlaced {
+        decoded.ok()?;
+    }
+    Some(match reader.output_color_type().0 {
+        png::ColorType::Rgba => DynamicImage::ImageRgba8(ImageBuffer::from_raw(w, h, buf)?),
+        png::ColorType::Rgb => DynamicImage::ImageRgb8(ImageBuffer::from_raw(w, h, buf)?),
+        png::ColorType::GrayscaleAlpha => {
+            DynamicImage::ImageLumaA8(ImageBuffer::from_raw(w, h, buf)?)
+        }
+        png::ColorType::Grayscale => DynamicImage::ImageLuma8(ImageBuffer::from_raw(w, h, buf)?),
+        png::ColorType::Indexed => return None,
+    })
+}
+
+/// An opaque palette PNG of 2 to 8 bits as stored: its RGB palette and its
+/// packed index rows (byte-aligned, as PDF reads them).
+struct PaletteImage {
+    palette: Vec<u8>,
+    bits: u8,
+    rows: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+/// Word keeps an opaque palette PNG it does not resample as an Indexed image
+/// at the stored depth (bush_fires' 98×18 strip, learning_cultures' 850×520
+/// chart); one with tRNS becomes RGB plus an SMask, and 1-bit black-and-white
+/// ones go DeviceGray (`stored_one_bit`).
+fn palette_png(data: &[u8]) -> Option<PaletteImage> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(data))
+        .read_info()
+        .ok()?;
+    let info = reader.info();
+    if info.color_type != png::ColorType::Indexed
+        || info.trns.is_some()
+        || info.bit_depth == png::BitDepth::One
+    {
+        return None;
+    }
+    let palette = info.palette.as_deref()?.to_vec();
+    let bits = info.bit_depth as u8;
+    let (width, height) = (info.width, info.height);
+    let mut rows = vec![0u8; reader.output_buffer_size()?];
+    reader.next_frame(&mut rows).ok()?;
+    Some(PaletteImage {
+        palette,
+        bits,
+        rows,
+        width,
+        height,
+    })
+}
+
+/// Records a picture for the display list while a recording session is open
+/// (`canvas::recording`); `image` is only built then.
+fn capture(reference: Ref, image: Image, soft_mask: Option<Ref>) {
+    if canvas::recording() {
+        canvas::capture_image(reference, image, soft_mask);
+    }
+}
+
+/// Write an image XObject into the PDF with the given filter and data.
+/// Optionally attaches a soft mask (alpha channel) reference.
+/// Write an 8-bit image XObject, its color space picked from the component
+/// count (1=gray, 4=cmyk, else rgb).
+fn write_image_xobject(
+    pdf: &mut Pdf,
+    xobj_ref: Ref,
+    data: &[u8],
+    filter: Filter,
+    (w, h): (u32, u32),
+    components: u8,
+    smask: Option<Ref>,
+) {
+    capture(
+        xobj_ref,
+        Image {
+            width: w,
+            height: h,
+            color_space: match components {
+                1 => ImageColorSpace::Gray,
+                4 => ImageColorSpace::Cmyk,
+                _ => ImageColorSpace::Rgb,
+            },
+            bits_per_component: 8,
+            filter: match filter {
+                Filter::DctDecode => ImageFilter::Jpeg,
+                _ => ImageFilter::Flate,
+            },
+            data: data.to_vec(),
+            soft_mask: None,
+            interpolate: matches!(filter, Filter::DctDecode),
+        },
+        smask,
+    );
+    let mut xobj = pdf.image_xobject(xobj_ref, data);
+    xobj.filter(filter);
+    xobj.width(w as i32);
+    xobj.height(h as i32);
+    match components {
+        1 => xobj.color_space().device_gray(),
+        4 => xobj.color_space().device_cmyk(),
+        _ => xobj.color_space().device_rgb(),
+    };
+    xobj.bits_per_component(8);
+    // Word smooths only its JPEGs: every Flate picture in the fixture
+    // references has /Interpolate false (118 against 7 DCT ones).
+    if matches!(filter, Filter::DctDecode) {
+        xobj.interpolate(true);
+    }
+    if let Some(mask_ref) = smask {
+        xobj.s_mask(mask_ref);
+    }
+}
+
+/// Embed a DeviceGray SMask image XObject from deflate-compressed pixel data.
+/// Caller allocates `mask_ref`. `interpolate` is per-caller: the alpha-channel
+/// mask leaves it off (interpolating it measurably lowers fidelity on case12).
+fn write_gray_mask_xobject(
+    pdf: &mut Pdf,
+    mask_ref: Ref,
+    compressed: &[u8],
+    w: u32,
+    h: u32,
+    interpolate: bool,
+) {
+    capture(
+        mask_ref,
+        Image {
+            width: w,
+            height: h,
+            color_space: ImageColorSpace::Gray,
+            bits_per_component: 8,
+            filter: ImageFilter::Flate,
+            data: compressed.to_vec(),
+            soft_mask: None,
+            interpolate,
+        },
+        None,
+    );
+    let mut mask = pdf.image_xobject(mask_ref, compressed);
+    mask.filter(Filter::FlateDecode);
+    mask.width(w as i32);
+    mask.height(h as i32);
+    mask.color_space().device_gray();
+    mask.bits_per_component(8);
+    if interpolate {
+        mask.interpolate(true);
+    }
+}
+
+/// Embed a 1×1 solid-color RGB image XObject masked by a DeviceGray SMask (both
+/// built here, mask first). Caller allocates both refs.
+fn write_solid_color_with_gray_mask(
+    pdf: &mut Pdf,
+    color_ref: Ref,
+    mask_ref: Ref,
+    color: [u8; 3],
+    compressed_mask: &[u8],
+    mask_w: u32,
+    mask_h: u32,
+) {
+    write_gray_mask_xobject(pdf, mask_ref, compressed_mask, mask_w, mask_h, true);
+    capture(
+        color_ref,
+        Image {
+            width: 1,
+            height: 1,
+            color_space: ImageColorSpace::Rgb,
+            bits_per_component: 8,
+            filter: ImageFilter::None,
+            data: color.to_vec(),
+            soft_mask: None,
+            interpolate: true,
+        },
+        Some(mask_ref),
+    );
+    let mut color_img = pdf.image_xobject(color_ref, &color);
+    color_img.width(1);
+    color_img.height(1);
+    color_img.color_space().device_rgb();
+    color_img.bits_per_component(8);
+    color_img.interpolate(true);
+    color_img.s_mask(mask_ref);
+}
+
+/// Matrix mapping the visible crop window of a unit-square image onto the unit square.
+/// `src_rect` is (l, t, r, b) as fractions of the source. Image space is y-up, so the
+/// bottom crop is the vertical offset.
+fn crop_matrix([l, t, r, b]: [f32; 4]) -> [f32; 6] {
+    let sx = 1.0 / (1.0 - l - r);
+    let sy = 1.0 / (1.0 - t - b);
+    [sx, 0.0, 0.0, sy, -l * sx, -b * sy]
+}
+
+/// The embedding pass: the document being written, the handles every XObject
+/// needs, and the running registries that hand pictures and effects their names.
+struct Embedder<'a, A: FnMut() -> Ref> {
+    pdf: &'a mut Pdf,
+    alloc: &'a mut A,
+    fonts: &'a HashMap<String, FontEntry>,
+    resample: bool,
+    xobjects: ImageXObjects,
+    effect_count: usize,
+}
+
+impl<A: FnMut() -> Ref> Embedder<'_, A> {
+    fn next_ref(&mut self) -> Ref {
+        (self.alloc)()
+    }
+
+    /// Register a written XObject under the next `Im{n}` page-resource name.
+    fn register_xobject(&mut self, xobj_ref: Ref) -> String {
+        let pdf_name = format!("Im{}", self.xobjects.named.len() + 1);
+        self.xobjects.named.push((pdf_name.clone(), xobj_ref));
+        pdf_name
+    }
+
+    fn register_effect(&mut self, xobj_ref: Ref) -> String {
+        self.effect_count += 1;
+        let name = format!("Sh{}", self.effect_count);
+        self.xobjects.named.push((name.clone(), xobj_ref));
+        name
+    }
+
+    /// Embed one image and return its XObject name. A cropped picture (`a:srcRect`) is
+    /// wrapped in a Form XObject whose unit-square BBox clips the scaled and offset source,
+    /// so every draw site keeps its plain `w 0 0 h x y cm /Im Do` and EMF forms nest as-is.
+    fn embed(&mut self, img: &EmbeddedImage) -> String {
+        // The frame shows only the crop window, so the whole source is drawn at
+        // frame / visible fraction; downscaling and soft-edge radii must see that extent.
+        let display = match img.src_rect {
+            Some([l, t, r, b]) => (
+                img.display_width / (1.0 - l - r),
+                img.display_height / (1.0 - t - b),
+            ),
+            None => (img.display_width, img.display_height),
+        };
+        let key = ImageKey::new(img, display, self.resample);
+        let target = key.target;
+        // ponytail: the reflection re-decodes the uncropped source and the soft-edge mask
+        // rings the source's edges; crop those too if a fixture ever combines them.
+        let inner_ref = match self.xobjects.shared.get(&key) {
+            Some(&r) => r,
+            None => {
+                let r = self.embed_image_xobject(img, display.0, target);
+                self.xobjects.shared.insert(key, r);
+                r
+            }
+        };
+        let Some(src_rect) = img.src_rect else {
+            return self.register_xobject(inner_ref);
+        };
+        let mut content = Content::new();
+        content.transform(crop_matrix(src_rect));
+        content.x_object(Name(b"Src"));
+        let form_ref = self.next_ref();
+        canvas::capture_form(
+            form_ref,
+            [0.0, 0.0, 1.0, 1.0],
+            content.take_recording(),
+            &[("Src", inner_ref)],
+        );
+        let bytes = content.finish();
+        let mut form = self.pdf.form_xobject(form_ref, &bytes);
+        form.bbox(Rect::new(0.0, 0.0, 1.0, 1.0));
+        form.resources().x_objects().pair(Name(b"Src"), inner_ref);
+        drop(form);
+        self.register_xobject(form_ref)
+    }
+
+    /// Write the image (or EMF form) XObject, downscaled to `target`, and return its ref.
+    /// `display_width` is the width in points the whole source is drawn at; it scales
+    /// soft-edge radii.
+    fn embed_image_xobject(
+        &mut self,
+        img: &EmbeddedImage,
+        display_width: f32,
+        target: Option<(u32, u32)>,
+    ) -> Ref {
+        let xobj_ref = self.next_ref();
+
+        // Helper: create soft-edge SMask for a given pixel size
+        let make_soft_edge_smask =
+            |w: u32, h: u32, pdf: &mut Pdf, alloc: &mut dyn FnMut() -> Ref| -> Option<Ref> {
+                let se = img.soft_edge.as_ref()?;
+                let radius_px = se.radius * w as f32 / display_width;
+                let mask_data = super::color::generate_soft_edge_mask(w, h, radius_px);
+                let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&mask_data, 6);
+                let mask_ref = alloc();
+                write_gray_mask_xobject(pdf, mask_ref, &compressed, w, h, true);
+                Some(mask_ref)
+            };
+
+        match img.format {
+            ImageFormat::Jpeg => {
+                // Decode -> resize / recolour -> re-encode as JPEG. Word always
+                // re-encodes at the picture's own pixel size (a 1706×1279 photo
+                // shrinks 1371 KB → 374 KB with no pixel loss), so take this path
+                // even when no resize is needed; `target` only decides the size.
+                // A decode failure falls through to embedding the original bytes.
+                {
+                    let cursor = std::io::Cursor::new(img.data.as_slice());
+                    let reader = image::ImageReader::with_format(
+                        std::io::BufReader::new(cursor),
+                        image::ImageFormat::Jpeg,
+                    );
+                    if let Ok(decoded) = reader.decode() {
+                        let resized = match target {
+                            Some((tw, th)) => {
+                                decoded.resize_exact(tw, th, image::imageops::FilterType::Lanczos3)
+                            }
+                            None => decoded,
+                        };
+                        let mut rgb = resized.into_rgb8();
+                        // ponytail: a JPEG's alphaModFix is not applied.
+                        apply_blip_colors(img, &mut rgb);
+                        let (tw, th) = rgb.dimensions();
+                        if let Some(jpeg_buf) = encode_jpeg(&rgb) {
+                            log::debug!(
+                                "Re-encoded JPEG {}x{} -> {}x{} ({} -> {} bytes)",
+                                img.pixel_width,
+                                img.pixel_height,
+                                tw,
+                                th,
+                                img.data.len(),
+                                jpeg_buf.len()
+                            );
+                            let se_mask = make_soft_edge_smask(tw, th, self.pdf, self.alloc);
+                            write_image_xobject(
+                                self.pdf,
+                                xobj_ref,
+                                &jpeg_buf,
+                                Filter::DctDecode,
+                                (tw, th),
+                                3,
+                                se_mask,
+                            );
+                            return xobj_ref;
+                        }
+                    }
+                    // Fall through to raw embed on failure
+                }
+                // Passthrough: embed original JPEG bytes directly
+                let se_mask =
+                    make_soft_edge_smask(img.pixel_width, img.pixel_height, self.pdf, self.alloc);
+                write_image_xobject(
+                    self.pdf,
+                    xobj_ref,
+                    &img.data,
+                    Filter::DctDecode,
+                    (img.pixel_width, img.pixel_height),
+                    img.jpeg_components,
+                    se_mask,
+                );
+            }
+            ImageFormat::Png | ImageFormat::Bmp => {
+                let untouched = target.is_none()
+                    && !img.recolored()
+                    && img.alpha.is_none()
+                    && img.soft_edge.is_none();
+                if let Some(p) = untouched.then(|| palette_png(&img.data)).flatten() {
+                    // The palette goes in its own Flate stream, as in Word's
+                    // files: inline it costs more than a small image saves.
+                    let lookup_ref = self.next_ref();
+                    let lookup = miniz_oxide::deflate::compress_to_vec_zlib(&p.palette, 6);
+                    self.pdf
+                        .stream(lookup_ref, &lookup)
+                        .filter(Filter::FlateDecode);
+                    let data = miniz_oxide::deflate::compress_to_vec_zlib(&p.rows, 6);
+                    capture(
+                        xobj_ref,
+                        Image {
+                            width: p.width,
+                            height: p.height,
+                            color_space: ImageColorSpace::IndexedRgb {
+                                palette: p.palette.clone(),
+                            },
+                            bits_per_component: p.bits,
+                            filter: ImageFilter::Flate,
+                            data: data.clone(),
+                            soft_mask: None,
+                            interpolate: false,
+                        },
+                        None,
+                    );
+                    let mut xobj = self.pdf.image_xobject(xobj_ref, &data);
+                    xobj.filter(Filter::FlateDecode);
+                    xobj.width(p.width as i32);
+                    xobj.height(p.height as i32);
+                    xobj.insert(Name(b"ColorSpace"))
+                        .array()
+                        .item(Name(b"Indexed"))
+                        .item(Name(b"DeviceRGB"))
+                        .item((p.palette.len() / 3) as i32 - 1)
+                        .item(lookup_ref);
+                    xobj.bits_per_component(p.bits as i32);
+                    return xobj_ref;
+                }
+                let img_fmt = match img.format {
+                    ImageFormat::Bmp => image::ImageFormat::Bmp,
+                    _ => image::ImageFormat::Png,
+                };
+                let cursor = std::io::Cursor::new(img.data.as_slice());
+                let reader =
+                    image::ImageReader::with_format(std::io::BufReader::new(cursor), img_fmt);
+                let decoded = match reader.decode() {
+                    Ok(d) => d,
+                    Err(_) => {
+                        // Fallback: use png crate directly for PNGs the image
+                        // crate's format-pinned reader can't decode
+                        match decode_png_raw(&img.data) {
+                            Some(img) => img,
+                            None => {
+                                log::warn!("PNG decode failed — writing 1x1 placeholder");
+                                capture(
+                                    xobj_ref,
+                                    Image {
+                                        width: 1,
+                                        height: 1,
+                                        color_space: ImageColorSpace::Rgb,
+                                        bits_per_component: 8,
+                                        filter: ImageFilter::None,
+                                        data: vec![255, 255, 255],
+                                        soft_mask: None,
+                                        interpolate: false,
+                                    },
+                                    None,
+                                );
+                                let mut xobj = self.pdf.image_xobject(xobj_ref, &[255, 255, 255]);
+                                xobj.width(1);
+                                xobj.height(1);
+                                xobj.color_space().device_rgb();
+                                xobj.bits_per_component(8);
+                                return xobj_ref;
+                            }
+                        }
+                    }
+                };
+
+                let bilevel = stored_one_bit(&img.data) && is_bilevel(&decoded);
+                let decoded = if let Some((tw, th)) = target {
+                    log::debug!(
+                        "Downscaling PNG/BMP {}x{} -> {}x{}",
+                        decoded.width(),
+                        decoded.height(),
+                        tw,
+                        th
+                    );
+                    decoded.resize_exact(tw, th, image::imageops::FilterType::Lanczos3)
+                } else {
+                    decoded
+                };
+
+                let rgba: image::RgbaImage = decoded.to_rgba8();
+                let (w, h) = (rgba.width(), rgba.height());
+                let pixel_count = (w * h) as usize;
+
+                // Single pass: split RGBA into RGB + alpha, detect transparency
+                let mut rgb_data = Vec::with_capacity(pixel_count * 3);
+                let mut alpha_data = Vec::with_capacity(pixel_count);
+                let mut has_alpha = false;
+                for p in rgba.pixels() {
+                    rgb_data.push(p.0[0]);
+                    rgb_data.push(p.0[1]);
+                    rgb_data.push(p.0[2]);
+                    let a = p.0[3];
+                    alpha_data.push(a);
+                    if a < 255 {
+                        has_alpha = true;
+                    }
+                }
+                apply_blip_colors(img, &mut rgb_data);
+                if let Some(opacity) = img.alpha {
+                    for a in &mut alpha_data {
+                        *a = (*a as f32 * opacity).round() as u8;
+                    }
+                    has_alpha = true;
+                }
+
+                // Apply soft-edge mask: multiply with existing alpha or create new alpha
+                if let Some(se) = img.soft_edge.as_ref() {
+                    let radius_px = se.radius * w as f32 / display_width;
+                    let se_mask = super::color::generate_soft_edge_mask(w, h, radius_px);
+                    if has_alpha {
+                        for (a, &se) in alpha_data.iter_mut().zip(se_mask.iter()) {
+                            *a = ((*a as u16 * se as u16) / 255) as u8;
+                        }
+                    } else {
+                        alpha_data = se_mask;
+                        has_alpha = true;
+                    }
+                }
+
+                // Word keeps a black-and-white source at 1 bit per sample (DeviceGray,
+                // Flate, no Interpolate) even after downsampling: geneva_waste's logo
+                // is 589 bytes in its export and was 3.7 KB here as an RGB JPEG.
+                if bilevel && !has_alpha && !img.recolored() {
+                    let packed = pack_bilevel(&rgb_data, w, h);
+                    let data = miniz_oxide::deflate::compress_to_vec_zlib(&packed, 6);
+                    capture(
+                        xobj_ref,
+                        Image {
+                            width: w,
+                            height: h,
+                            color_space: ImageColorSpace::Gray,
+                            bits_per_component: 1,
+                            filter: ImageFilter::Flate,
+                            data: data.clone(),
+                            soft_mask: None,
+                            interpolate: false,
+                        },
+                        None,
+                    );
+                    let mut xobj = self.pdf.image_xobject(xobj_ref, &data);
+                    xobj.filter(Filter::FlateDecode);
+                    xobj.width(w as i32);
+                    xobj.height(h as i32);
+                    xobj.color_space().device_gray();
+                    xobj.bits_per_component(1);
+                    return xobj_ref;
+                }
+
+                let smask_ref = if has_alpha {
+                    let compressed_alpha =
+                        miniz_oxide::deflate::compress_to_vec_zlib(&alpha_data, 6);
+                    let mask_ref = self.next_ref();
+                    // Alpha mask: no interpolate (matches Word's output on case12).
+                    write_gray_mask_xobject(self.pdf, mask_ref, &compressed_alpha, w, h, false);
+                    Some(mask_ref)
+                } else {
+                    None
+                };
+
+                // Try both JPEG and Flate, pick whichever is smaller.
+                // JPEG wins for photographic content; Flate wins for synthetic/chart images.
+                let compressed_rgb = miniz_oxide::deflate::compress_to_vec_zlib(&rgb_data, 6);
+                let rgb = image::RgbImage::from_raw(w, h, rgb_data)
+                    .expect("RGB data size matches dimensions");
+                let jpeg_buf = encode_jpeg(&rgb);
+
+                let use_jpeg = jpeg_buf
+                    .as_ref()
+                    .is_some_and(|j| j.len() < compressed_rgb.len());
+
+                let (filter, data) = if use_jpeg {
+                    (Filter::DctDecode, jpeg_buf.unwrap())
+                } else {
+                    (Filter::FlateDecode, compressed_rgb)
+                };
+                write_image_xobject(self.pdf, xobj_ref, &data, filter, (w, h), 3, smask_ref);
+            }
+            ImageFormat::Emf | ImageFormat::Svg => {
+                // Translate EMF records (or SVG elements) into a PDF Form XObject.
+                // The xobj_ref we already allocated is unused — the translator
+                // allocates its own — so map the slot to the Form XObject ref instead.
+                let form_ref = if img.format == ImageFormat::Emf {
+                    super::emf::emf_to_form_xobject(
+                        &img.data, self.pdf, self.alloc, self.fonts, img.lum,
+                    )
+                } else {
+                    super::svg::svg_to_form_xobject(&img.data, self.pdf, self.alloc)
+                };
+                if let Some(form_ref) = form_ref {
+                    return form_ref;
+                }
+                // Conversion failed — register the wasted ref so it still maps to
+                // something (an empty form XObject) and the page content stream
+                // referencing it won't crash.
+                canvas::capture_form(xobj_ref, [0.0, 0.0, 1.0, 1.0], Vec::new(), &[]);
+                let mut empty = self.pdf.form_xobject(xobj_ref, b"");
+                empty.bbox(pdf_writer::Rect::new(0.0, 0.0, 1.0, 1.0));
+                drop(empty);
+            }
+        }
+
+        xobj_ref
+    }
+
+    /// Embed a shadow as a 1x1 solid-color Image XObject whose SMask is a
+    /// full-resolution Gaussian-blur grayscale mask. Returns the XObject name.
+    fn embed_shadow(
+        &mut self,
+        shadow: &ImageShadow,
+        display_width: f32,
+        display_height: f32,
+    ) -> String {
+        let (mask_pixels, mask_w, mask_h) = super::color::generate_shadow_mask(
+            display_width,
+            display_height,
+            shadow.blur_radius,
+            shadow.alpha,
+        );
+
+        // Compress the grayscale mask
+        let compressed_mask = miniz_oxide::deflate::compress_to_vec_zlib(&mask_pixels, 6);
+
+        // Grayscale mask + 1x1 solid color = the shadow image.
+        let mask_ref = self.next_ref();
+        let color_ref = self.next_ref();
+        write_solid_color_with_gray_mask(
+            self.pdf,
+            color_ref,
+            mask_ref,
+            shadow.color,
+            &compressed_mask,
+            mask_w,
+            mask_h,
+        );
+
+        self.register_effect(color_ref)
+    }
+
+    /// Embed a reflection: re-embed the image data with a vertical gradient SMask.
+    /// Returns the XObject name, or None if the image can't be re-embedded.
+    fn embed_reflection(
+        &mut self,
+        img: &EmbeddedImage,
+        refl: &crate::model::ImageReflection,
+    ) -> Option<String> {
+        // Generate vertical gradient mask: 1 pixel wide, image pixel height tall.
+        // The rendering flips the image vertically, so image row 0 (top of original)
+        // becomes the bottom of the reflection (far from image), and the last row
+        // (bottom of original) becomes the top of the reflection (near image).
+        // Only the bottom `end_pos` fraction of the image rows are visible; the rest
+        // are transparent. Within the visible band, alpha goes from endA at the cutoff
+        // edge to stA at the last row (which appears nearest the original image).
+        let grad_h = img.pixel_height.max(1);
+        let visible_start = ((1.0 - refl.end_pos) * grad_h as f32).round() as u32;
+        let visible_span = (grad_h - visible_start).max(1);
+        let mut grad_data = Vec::with_capacity(grad_h as usize);
+        for y in 0..grad_h {
+            if y < visible_start {
+                grad_data.push(0);
+            } else {
+                let t = (y - visible_start) as f32 / (visible_span - 1).max(1) as f32;
+                // t=0 at cutoff edge (far from image after flip) → endA
+                // t=1 at last row (near image after flip) → stA
+                let a = refl.end_alpha * (1.0 - t) + refl.start_alpha * t;
+                grad_data.push((a * 255.0).round().min(255.0) as u8);
+            }
+        }
+        let compressed_grad = miniz_oxide::deflate::compress_to_vec_zlib(&grad_data, 6);
+        let grad_ref = self.next_ref();
+        write_gray_mask_xobject(self.pdf, grad_ref, &compressed_grad, 1, grad_h, true);
+
+        // Re-embed the same image data as a new XObject with the gradient as SMask.
+        let refl_ref = self.next_ref();
+        match img.format {
+            ImageFormat::Jpeg => {
+                write_image_xobject(
+                    self.pdf,
+                    refl_ref,
+                    &img.data,
+                    Filter::DctDecode,
+                    (img.pixel_width, img.pixel_height),
+                    img.jpeg_components,
+                    Some(grad_ref),
+                );
+            }
+            ImageFormat::Emf | ImageFormat::Svg => return None,
+            ImageFormat::Png | ImageFormat::Bmp => {
+                // Decode and re-encode as RGB (strip any existing alpha — the gradient replaces it)
+                let img_fmt = match img.format {
+                    ImageFormat::Bmp => image::ImageFormat::Bmp,
+                    _ => image::ImageFormat::Png,
+                };
+                let cursor = std::io::Cursor::new(img.data.as_slice());
+                let reader =
+                    image::ImageReader::with_format(std::io::BufReader::new(cursor), img_fmt);
+                let decoded = match reader.decode() {
+                    Ok(d) => d,
+                    Err(_) => return None,
+                };
+                let rgb = decoded.to_rgb8();
+                let (w, h) = (rgb.width(), rgb.height());
+                let rgb_data: Vec<u8> = rgb.into_raw();
+
+                if let Some(jpeg_buf) = encode_jpeg(
+                    &image::RgbImage::from_raw(w, h, rgb_data.clone())
+                        .expect("RGB data size matches"),
+                ) {
+                    write_image_xobject(
+                        self.pdf,
+                        refl_ref,
+                        &jpeg_buf,
+                        Filter::DctDecode,
+                        (w, h),
+                        3,
+                        Some(grad_ref),
+                    );
+                } else {
+                    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&rgb_data, 6);
+                    write_image_xobject(
+                        self.pdf,
+                        refl_ref,
+                        &compressed,
+                        Filter::FlateDecode,
+                        (w, h),
+                        3,
+                        Some(grad_ref),
+                    );
+                }
+            }
+        }
+
+        Some(self.register_effect(refl_ref))
+    }
+
+    /// Build all effect XObjects for one image (shadow, glow, etc.).
+    fn embed_effects(&mut self, img: &EmbeddedImage) -> EffectXObjs {
+        let mut fx = EffectXObjs::default();
+        if let Some(shadow) = img.shadow.as_ref()
+            && shadow.blur_radius > 0.0
+        {
+            fx.shadow = Some(self.embed_shadow(shadow, img.display_width, img.display_height));
+        }
+        if let Some(glow) = img.glow.as_ref() {
+            // Glow reuses shadow embedding: centered blur (zero offset) with glow color
+            let shadow_equiv = crate::model::ImageShadow {
+                offset_x: 0.0,
+                offset_y: 0.0,
+                blur_radius: glow.radius,
+                color: glow.color,
+                alpha: glow.alpha,
+            };
+            fx.glow = Some(self.embed_shadow(&shadow_equiv, img.display_width, img.display_height));
+        }
+        if let Some(inner) = img.inner_shadow.as_ref() {
+            let (mask_pixels, mask_w, mask_h) = super::color::generate_inner_shadow_mask(
+                img.display_width,
+                img.display_height,
+                inner.blur_radius,
+                inner.alpha,
+            );
+            let compressed_mask = miniz_oxide::deflate::compress_to_vec_zlib(&mask_pixels, 6);
+            let mask_ref = self.next_ref();
+            let color_ref = self.next_ref();
+            write_solid_color_with_gray_mask(
+                self.pdf,
+                color_ref,
+                mask_ref,
+                inner.color,
+                &compressed_mask,
+                mask_w,
+                mask_h,
+            );
+
+            fx.inner_shadow = Some(self.register_effect(color_ref));
+        }
+        if let Some(refl) = img.reflection.as_ref() {
+            fx.reflection = self.embed_reflection(img, refl);
+        }
+        fx
+    }
+
+    /// The picture and, when it has any, its effect XObjects.
+    fn embed_with_effects(&mut self, img: &EmbeddedImage) -> (String, Option<EffectXObjs>) {
+        let name = self.embed(img);
+        let fx = self.embed_effects(img);
+        (name, fx.has_any().then_some(fx))
+    }
+
+    /// Embed a picture once per drawing (see `EmbeddedImage::id`).
+    fn embed_keyed(&mut self, img: &EmbeddedImage, names: &mut HashMap<usize, String>) {
+        names.entry(img.id).or_insert_with(|| self.embed(img));
+    }
+
+    /// `embed_keyed` for a table-cell picture, with its effects.
+    fn embed_table_image(
+        &mut self,
+        img: &EmbeddedImage,
+        names: &mut HashMap<usize, String>,
+        effect_names: &mut HashMap<usize, EffectXObjs>,
+    ) {
+        if let std::collections::hash_map::Entry::Vacant(e) = names.entry(img.id) {
+            let (name, fx) = self.embed_with_effects(img);
+            e.insert(name);
+            if let Some(fx) = fx {
+                effect_names.insert(img.id, fx);
+            }
+        }
+    }
+
+    fn embed_textbox_images(&mut self, tb: &Textbox, names: &mut HashMap<usize, String>) {
+        let mut embed = |img: &EmbeddedImage| self.embed_keyed(img, names);
+        if let Some(img) = &tb.picture_fill {
+            embed(img);
+        }
+        let mut stack: Vec<&[Paragraph]> = vec![tb.content()];
+        while let Some(paras) = stack.pop() {
+            for para in paras {
+                if let Some(img) = &para.image {
+                    embed(img);
+                }
+                for run in &para.runs {
+                    if let Some(img) = &run.inline_image {
+                        embed(img);
+                    }
+                }
+                for fi in &para.floating_images {
+                    embed(&fi.image);
+                }
+                for nested in &para.textboxes {
+                    if let Some(img) = &nested.picture_fill {
+                        embed(img);
+                    }
+                    stack.push(&nested.paragraphs);
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn embed_all_images(
+    doc: &Document,
+    pdf: &mut Pdf,
+    alloc: &mut impl FnMut() -> Ref,
+    fonts: &HashMap<String, FontEntry>,
+    resample: bool,
+) -> EmbeddedImages {
+    let mut em = Embedder {
+        pdf,
+        alloc,
+        fonts,
+        resample,
+        xobjects: ImageXObjects::default(),
+        effect_count: 0,
+    };
+    let mut image_pdf_names: HashMap<usize, String> = HashMap::new();
+    let mut inline_image_pdf_names: HashMap<(usize, usize), String> = HashMap::new();
+    let mut floating_image_pdf_names: HashMap<(usize, usize), String> = HashMap::new();
+    let mut effect_names: HashMap<usize, EffectXObjs> = HashMap::new();
+    let mut effect_floating_names: HashMap<(usize, usize), EffectXObjs> = HashMap::new();
+    let mut effect_inline_names: HashMap<(usize, usize), EffectXObjs> = HashMap::new();
+
+    {
+        let mut global_block_idx = 0usize;
+        for section in &doc.sections {
+            for block in &section.blocks {
+                if let Block::Paragraph(para) = block {
+                    if let Some(img) = &para.image {
+                        let (name, fx) = em.embed_with_effects(img);
+                        image_pdf_names.insert(global_block_idx, name);
+                        if let Some(fx) = fx {
+                            effect_names.insert(global_block_idx, fx);
+                        }
+                    }
+                    for (run_idx, run) in para.runs.iter().enumerate() {
+                        if let Some(img) = &run.inline_image {
+                            let (name, fx) = em.embed_with_effects(img);
+                            inline_image_pdf_names.insert((global_block_idx, run_idx), name);
+                            if let Some(fx) = fx {
+                                effect_inline_names.insert((global_block_idx, run_idx), fx);
+                            }
+                        }
+                    }
+                    for (fi_idx, fi) in para.floating_images.iter().enumerate() {
+                        let (name, fx) = em.embed_with_effects(&fi.image);
+                        floating_image_pdf_names.insert((global_block_idx, fi_idx), name);
+                        if let Some(fx) = fx {
+                            effect_floating_names.insert((global_block_idx, fi_idx), fx);
+                        }
+                    }
+                }
+                global_block_idx += 1;
+            }
+        }
+    }
+
+    let mut hf_image_names: HashMap<(usize, u8, usize), String> = HashMap::new();
+    let mut hf_inline_image_names: HashMap<(usize, u8, usize, usize), String> = HashMap::new();
+    let mut hf_floating_image_names: HashMap<(usize, u8, usize, usize), String> = HashMap::new();
+    let mut effect_hf_names: HashMap<(usize, u8, usize), EffectXObjs> = HashMap::new();
+    // ponytail: the effects of header/footer inline and floating pictures are
+    // embedded (keeping the XObject numbering) but never drawn.
+    {
+        for (si, section) in doc.sections.iter().enumerate() {
+            for (hf_type, hf) in section_hfs(&section.properties).into_iter().enumerate() {
+                if let Some(hf) = hf {
+                    let hf_type = hf_type as u8;
+                    let mut pi = 0usize;
+                    for block in &hf.blocks {
+                        if let Block::Paragraph(para) = block {
+                            if let Some(img) = &para.image {
+                                let (name, fx) = em.embed_with_effects(img);
+                                hf_image_names.insert((si, hf_type, pi), name);
+                                if let Some(fx) = fx {
+                                    effect_hf_names.insert((si, hf_type, pi), fx);
+                                }
+                            }
+                            for (ri, run) in para.runs.iter().enumerate() {
+                                if let Some(img) = &run.inline_image {
+                                    let (name, _) = em.embed_with_effects(img);
+                                    hf_inline_image_names.insert((si, hf_type, pi, ri), name);
+                                }
+                            }
+                            for (fi, floating) in para.floating_images.iter().enumerate() {
+                                let (name, _) = em.embed_with_effects(&floating.image);
+                                hf_floating_image_names.insert((si, hf_type, pi, fi), name);
+                            }
+                            pi += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut all_textboxes: Vec<&Textbox> = Vec::new();
+    for section in &doc.sections {
+        for block in &section.blocks {
+            push_block_textboxes(block, &mut all_textboxes);
+        }
+        for hf in section_hfs(&section.properties).into_iter().flatten() {
+            for block in &hf.blocks {
+                push_block_textboxes(block, &mut all_textboxes);
+            }
+        }
+    }
+
+    let mut table_cell_image_names: HashMap<usize, String> = HashMap::new();
+    let mut effect_table_names: HashMap<usize, EffectXObjs> = HashMap::new();
+    {
+        let mut tables: Vec<&Table> = Vec::new();
+        for section in &doc.sections {
+            for block in &section.blocks {
+                if let Block::Table(table) = block {
+                    tables.push(table);
+                }
+            }
+            for hf in section_hfs(&section.properties).into_iter().flatten() {
+                for block in &hf.blocks {
+                    if let Block::Table(table) = block {
+                        tables.push(table);
+                    }
+                }
+            }
+        }
+        tables.extend(
+            all_textboxes
+                .iter()
+                .flat_map(|tb| tb.content_tables())
+                .map(|(_, t)| t),
+        );
+        for para in tables.into_iter().flat_map(|t| t.all_paragraphs()) {
+            for img in para
+                .image
+                .iter()
+                .chain(para.runs.iter().filter_map(|run| run.inline_image.as_ref()))
+                .chain(para.floating_images.iter().map(|fi| &fi.image))
+            {
+                em.embed_table_image(img, &mut table_cell_image_names, &mut effect_table_names);
+            }
+        }
+    }
+
+    // ponytail: textbox images get no shadow/glow effects; embed them with
+    // embed_image_effects and draw them in textbox_render if they matter.
+    let mut textbox_image_names: HashMap<usize, String> = HashMap::new();
+    for &tb in &all_textboxes {
+        em.embed_textbox_images(tb, &mut textbox_image_names);
+    }
+
+    let mut smartart_image_names: HashMap<usize, String> = HashMap::new();
+    for section in &doc.sections {
+        for block in &section.blocks {
+            if let Block::Paragraph(para) = block {
+                for diagram in para.smartart.iter().chain(&para.floating_smartart) {
+                    for shape in &diagram.shapes {
+                        if let Some(ref img) = shape.image_fill {
+                            em.embed_keyed(img, &mut smartart_image_names);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    EmbeddedImages {
+        image_pdf_names,
+        inline_image_pdf_names,
+        floating_image_pdf_names,
+        image_xobjects: em.xobjects.named,
+        hf_image_names,
+        hf_inline_image_names,
+        hf_floating_image_names,
+        table_cell_image_names,
+        textbox_image_names,
+        smartart_image_names,
+        effect_names,
+        effect_floating_names,
+        effect_inline_names,
+        effect_hf_names,
+        effect_table_names,
+    }
+}
+
+/// A section's header and footer parts, in the order the `hf_type` keys number them.
+fn section_hfs(sp: &SectionProperties) -> [Option<&HeaderFooter>; 6] {
+    [
+        sp.header_default.as_ref(),
+        sp.header_first.as_ref(),
+        sp.footer_default.as_ref(),
+        sp.footer_first.as_ref(),
+        sp.header_even.as_ref(),
+        sp.footer_even.as_ref(),
+    ]
+}
+
+fn push_block_textboxes<'a>(block: &'a Block, out: &mut Vec<&'a Textbox>) {
+    match block {
+        Block::Paragraph(para) => {
+            for tb in &para.textboxes {
+                push_textbox(tb, out);
+            }
+        }
+        Block::Table(table) => {
+            for tb in table.all_paragraphs().flat_map(|p| &p.textboxes) {
+                push_textbox(tb, out);
+            }
+        }
+    }
+}
+
+/// The box and the boxes in the cells of its tables, at any depth.
+fn push_textbox<'a>(tb: &'a Textbox, out: &mut Vec<&'a Textbox>) {
+    out.push(tb);
+    for para in tb.table_paragraphs() {
+        for nested in &para.textboxes {
+            push_textbox(nested, out);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_lum, crop_matrix, is_bilevel, pack_bilevel, palette_png, stored_one_bit};
+
+    #[test]
+    fn mixed_cell_paragraph_pictures_are_embedded_in_all_table_stories() {
+        let inputs: [&[u8]; 5] = [
+            include_bytes!("../../tests/fixtures/cases/cell-inline-body/input.docx"),
+            include_bytes!("../../tests/fixtures/cases/cell-inline-header/input.docx"),
+            include_bytes!("../../tests/fixtures/cases/cell-inline-nested/input.docx"),
+            include_bytes!("../../tests/fixtures/cases/cell-inline-tabbed/input.docx"),
+            include_bytes!("../../tests/fixtures/cases/cell-inline-exact/input.docx"),
+        ];
+        for input in inputs {
+            let doc = crate::docx::parse_bytes(input, crate::RevisionView::Final).unwrap();
+            let mut pdf = pdf_writer::Pdf::new();
+            let mut next = 1;
+            let images = super::embed_all_images(
+                &doc,
+                &mut pdf,
+                &mut || {
+                    let reference = pdf_writer::Ref::new(next);
+                    next += 1;
+                    reference
+                },
+                &std::collections::HashMap::new(),
+                true,
+            );
+            assert_eq!(images.table_cell_image_names.len(), 1);
+            assert_eq!(images.image_xobjects.len(), 1);
+        }
+    }
+
+    #[test]
+    fn identical_pictures_share_their_image_xobject() {
+        use std::io::Cursor;
+        let picture = |blip: &str, crop: &str| {
+            format!(
+                r#"<w:r><w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="P"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:blipFill><a:blip r:embed="rIdImg">{blip}</a:blip>{crop}</pic:blipFill><pic:spPr/></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#
+            )
+        };
+        let ns = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture""#;
+        let para = |runs: &[String]| format!("<w:p>{}</w:p>", runs.concat());
+        let cell = |runs: &[String]| format!("<w:tc>{}</w:tc>", para(runs));
+        let plain = picture("", "");
+        let left = picture("", r#"<a:srcRect r="50000"/>"#);
+        let right = picture("", r#"<a:srcRect l="50000"/>"#);
+        let document = format!(
+            r#"<w:document {ns}><w:body>{}{}<w:tbl><w:tr>{}{}</w:tr></w:tbl><w:sectPr><w:headerReference w:type="default" r:id="rIdHdr"/></w:sectPr></w:body></w:document>"#,
+            para(&[plain.clone(), plain.clone(), left.clone()]),
+            para(&[picture("<a:grayscl/>", "")]),
+            cell(&[left]),
+            cell(&[right]),
+        );
+        let header = format!(r#"<w:hdr {ns}>{}</w:hdr>"#, para(&[plain]));
+        let rels = |media: &str, extra: &str| {
+            format!(
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdImg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/{media}"/>{extra}</Relationships>"#
+            )
+        };
+        let mut png = Vec::new();
+        image::RgbImage::from_fn(8, 8, |x, y| image::Rgb([x as u8 * 30, y as u8 * 30, 90]))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let doc = crate::docx::parse_parts(&[
+            ("word/document.xml", document.into_bytes()),
+            ("word/header1.xml", header.into_bytes()),
+            ("word/_rels/document.xml.rels", rels("image1.png", r#"<Relationship Id="rIdHdr" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>"#).into_bytes()),
+            ("word/_rels/header1.xml.rels", rels("image2.png", "").into_bytes()),
+            ("word/media/image1.png", png.clone()),
+            ("word/media/image2.png", png),
+        ]);
+        let mut pdf = pdf_writer::Pdf::new();
+        let mut next = 1;
+        let images = super::embed_all_images(
+            &doc,
+            &mut pdf,
+            &mut || {
+                next += 1;
+                pdf_writer::Ref::new(next)
+            },
+            &std::collections::HashMap::new(),
+            true,
+        );
+        let bytes = pdf.finish();
+        let image_xobjects = bytes
+            .windows(b"/Subtype /Image".len())
+            .filter(|w| *w == b"/Subtype /Image")
+            .count();
+        assert_eq!(
+            image_xobjects, 2,
+            "the plain and cropped pictures share one source"
+        );
+        assert_eq!(images.image_xobjects.len(), 7);
+        let cells: std::collections::HashSet<_> = images.table_cell_image_names.values().collect();
+        assert_eq!(cells.len(), 2, "each cell keeps its own crop");
+    }
+
+    #[test]
+    fn bilevel_sources_pack_to_one_bit_rows() {
+        let luma = |w, h, px: Vec<u8>| {
+            image::DynamicImage::ImageLuma8(image::GrayImage::from_raw(w, h, px).unwrap())
+        };
+        assert!(is_bilevel(&luma(3, 2, vec![0, 255, 0, 255, 255, 0])));
+        assert!(!is_bilevel(&luma(1, 1, vec![128])));
+        // Three pixels per row: one byte per row, MSB first, zero-padded.
+        let rgb: Vec<u8> = [0u8, 255, 0, 255, 255, 0]
+            .iter()
+            .flat_map(|&v| [v, v, v])
+            .collect();
+        assert_eq!(pack_bilevel(&rgb, 3, 2), vec![0b0100_0000, 0b1100_0000]);
+    }
+
+    #[test]
+    fn stored_depth_is_read_from_png_and_bmp_headers() {
+        let png = |depth: u8| {
+            let mut d = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x03\0\0\0\x02".to_vec();
+            d.extend_from_slice(&[depth, 0, 0, 0, 0]);
+            d
+        };
+        assert!(stored_one_bit(&png(1)));
+        assert!(!stored_one_bit(&png(8)));
+        let bmp = |header_size: u32, bits: u16| {
+            let mut d = b"BM".to_vec();
+            d.resize(14, 0);
+            d.extend_from_slice(&header_size.to_le_bytes());
+            d.resize(if header_size == 12 { 24 } else { 28 }, 0);
+            d.extend_from_slice(&bits.to_le_bytes());
+            d.resize(40, 0);
+            d
+        };
+        assert!(stored_one_bit(&bmp(40, 1)));
+        assert!(stored_one_bit(&bmp(12, 1)));
+        assert!(!stored_one_bit(&bmp(40, 24)));
+        assert!(!stored_one_bit(b"GIF89a"));
+    }
+
+    #[test]
+    fn opaque_palette_pngs_keep_their_indices() {
+        let encode = |depth: png::BitDepth, trns: Option<Vec<u8>>, rows: &[u8]| {
+            let mut out = Vec::new();
+            let mut enc = png::Encoder::new(&mut out, 3, 2);
+            enc.set_color(png::ColorType::Indexed);
+            enc.set_depth(depth);
+            enc.set_palette(vec![255, 0, 0, 0, 0, 255, 9, 9, 9]);
+            if let Some(t) = trns {
+                enc.set_trns(t);
+            }
+            enc.write_header().unwrap().write_image_data(rows).unwrap();
+            out
+        };
+        // Three 4-bit pixels per row pack into two bytes.
+        let p = palette_png(&encode(
+            png::BitDepth::Four,
+            None,
+            &[0x01, 0x20, 0x21, 0x00],
+        ))
+        .unwrap();
+        assert_eq!((p.bits, p.width, p.height), (4, 3, 2));
+        assert_eq!(p.rows, [0x01, 0x20, 0x21, 0x00]);
+        assert_eq!(p.palette.len(), 9);
+        assert!(palette_png(&encode(png::BitDepth::Eight, Some(vec![0]), &[0; 6])).is_none());
+        assert!(palette_png(&encode(png::BitDepth::One, None, &[0, 0])).is_none());
+    }
+
+    #[test]
+    fn lum_washes_out_faint_ink_but_keeps_dark_ink() {
+        // The stamp on the italian_evaluation_minutes signature scan is a pale
+        // purple; +30%/+30% pushes it to white while the blue ink stays visible.
+        let mut px = [200u8, 190, 220, 60, 60, 150, 128, 0, 255];
+        apply_lum(&mut px, 0.3, 0.3);
+        assert_eq!(&px[..3], &[255, 255, 255]);
+        assert!(px[3] < 140 && px[5] < 240, "{px:?}");
+        assert_eq!(px[6], 205); // mid-grey: unchanged by contrast, +76.5 brightness
+        assert_eq!(px[7], 22); // (0-128)*1.424+128+76.5
+        assert_eq!(px[8], 255);
+    }
+
+    #[test]
+    fn lum_zero_is_identity_and_negative_contrast_flattens() {
+        let mut px: Vec<u8> = (0..=255).step_by(51).map(|v| v as u8).collect();
+        let orig = px.clone();
+        apply_lum(&mut px, 0.0, 0.0);
+        assert_eq!(px, orig);
+        apply_lum(&mut px, 0.0, -1.0);
+        // -100% contrast collapses everything toward mid-grey
+        assert!(px.iter().all(|&v| (v as i32 - 128).abs() <= 2), "{px:?}");
+    }
+
+    #[test]
+    fn crop_matrix_maps_visible_window_onto_unit_square() {
+        // Image space is y-up: a top crop needs no offset, a bottom crop shifts the
+        // source down. A negative crop enlarges the window past the source (blank pad).
+        let cases = [
+            ([0.25, 0.0, 0.25, 0.0], [2.0, 0.0, 0.0, 1.0, -0.5, 0.0]),
+            ([0.0, 0.5, 0.0, 0.0], [1.0, 0.0, 0.0, 2.0, 0.0, 0.0]),
+            ([0.0, 0.0, 0.0, 0.5], [1.0, 0.0, 0.0, 2.0, 0.0, -1.0]),
+            (
+                [-0.2, 0.0, 0.0, 0.0],
+                [1.0 / 1.2, 0.0, 0.0, 1.0, 0.2 / 1.2, 0.0],
+            ),
+        ];
+        for (rect, want) in cases {
+            let got = crop_matrix(rect);
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < 1e-5, "{rect:?}: {got:?} != {want:?}");
+            }
+        }
+    }
+}
