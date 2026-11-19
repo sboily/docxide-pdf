@@ -16,8 +16,8 @@ use pdf_writer::types::{ColorSpaceOperand, LineCapStyle, LineJoinStyle, TextRend
 use pdf_writer::{Buf, Name, Primitive, Ref, Str};
 
 use crate::display::{
-    Color, DisplayDocument, FillRule, Image, LineCap, LineJoin, Matrix, Paint, Path, Segment,
-    StrokeStyle, TextMode,
+    Color, Document as DisplayDocument, FillRule, Image, LineCap, LineJoin, Matrix, Paint, Path,
+    Segment, StrokeStyle, StructType, TextMode,
 };
 
 pub(crate) const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
@@ -58,7 +58,6 @@ pub(crate) enum Captured {
     /// resources name.
     Form {
         bbox: [f32; 4],
-        matrix: Matrix,
         items: Vec<Rec>,
         xobjects: Vec<(String, i32)>,
     },
@@ -82,12 +81,13 @@ pub(crate) fn with_session(f: impl FnOnce(&mut Session)) {
     });
 }
 
-/// Records a written image XObject.
-pub(crate) fn capture_image(reference: Ref, image: Image, soft_mask: Option<Ref>) {
+/// Records a written image XObject; `image` is only built while a session is
+/// open, so plain conversions do not copy picture bytes.
+pub(crate) fn capture_image(reference: Ref, image: impl FnOnce() -> Image, soft_mask: Option<Ref>) {
     with_session(|s| {
         s.xobjects.insert(
             reference.get(),
-            Captured::Image(image, soft_mask.map(Ref::get)),
+            Captured::Image(image(), soft_mask.map(Ref::get)),
         );
     });
 }
@@ -105,7 +105,6 @@ pub(crate) fn capture_form(
             reference.get(),
             Captured::Form {
                 bbox,
-                matrix: IDENTITY,
                 items,
                 xobjects: xobjects
                     .iter()
@@ -116,31 +115,24 @@ pub(crate) fn capture_form(
     });
 }
 
-/// An open recording session; closing it (or dropping it) restores what was
-/// open before.
-pub(crate) struct Recording {
-    previous: Option<Session>,
-}
+/// An open recording session; dropping it closes the session.
+pub(crate) struct Recording;
 
 impl Recording {
     pub(crate) fn start() -> Self {
-        let previous = SESSION.with(|s| s.borrow_mut().replace(Session::default()));
-        Recording { previous }
+        SESSION.with(|s| *s.borrow_mut() = Some(Session::default()));
+        Recording
     }
 
     /// The document the last pass recorded.
-    pub(crate) fn finish(mut self) -> Option<DisplayDocument> {
-        let previous = self.previous.take();
-        SESSION
-            .with(|s| std::mem::replace(&mut *s.borrow_mut(), previous))
-            .and_then(|session| session.document)
+    pub(crate) fn finish(self) -> Option<DisplayDocument> {
+        SESSION.with(|s| s.borrow_mut().as_mut()?.document.take())
     }
 }
 
 impl Drop for Recording {
     fn drop(&mut self) {
-        let previous = self.previous.take();
-        SESSION.with(|s| *s.borrow_mut() = previous);
+        SESSION.with(|s| *s.borrow_mut() = None);
     }
 }
 
@@ -168,10 +160,12 @@ pub(crate) enum Rec {
     },
     Text(RecText),
     XObject(String),
-    /// `BMC`, or `BDC` with an `/MCID` when `mcid` is set.
-    BeginMarked {
-        tag: String,
-        mcid: Option<i32>,
+    /// `BMC` with this tag.
+    BeginMarked(String),
+    /// `BDC` with an `/MCID`: content of a structure element.
+    BeginTagged {
+        kind: StructType,
+        mcid: i32,
     },
     /// `EMC`.
     EndMarked,
@@ -330,21 +324,19 @@ impl Content {
     ) -> &mut Self {
         let array: Vec<f32> = array.into_iter().collect();
         self.inner.set_dash_pattern(array.iter().copied(), phase);
-        self.record(|r| r.state.line.dash = (array, phase));
+        self.record(|r| {
+            r.state.line.dash = array;
+            r.state.line.dash_phase = phase;
+        });
         self
     }
 
-    /// `gs`: only the layout's fill opacities (`GSa{percent}`, see
-    /// `color::set_fill_alpha`) change what is recorded.
-    pub(crate) fn set_parameters(&mut self, dict: Name) -> &mut Self {
-        self.inner.set_parameters(dict);
-        let alpha = dict
-            .0
-            .strip_prefix(b"GSa")
-            .and_then(|pct| std::str::from_utf8(pct).ok()?.parse::<u8>().ok());
-        if let Some(pct) = alpha {
-            self.record(|r| r.state.fill_alpha = f32::from(pct) / 100.0);
-        }
+    /// `gs` with the page's `GSa{pct}` ExtGState (see assembly): fill at
+    /// `pct` percent opacity.
+    pub(crate) fn set_fill_alpha(&mut self, pct: u8) -> &mut Self {
+        self.inner
+            .set_parameters(Name(format!("GSa{pct}").as_bytes()));
+        self.record(|r| r.state.fill_alpha = f32::from(pct) / 100.0);
         self
     }
 
@@ -388,8 +380,7 @@ impl Content {
         name: Name,
     ) -> &mut Self {
         self.inner.set_fill_pattern(tint, name);
-        let name = String::from_utf8_lossy(name.0).into_owned();
-        self.record(|r| r.state.fill = FillColor::Pattern(name));
+        self.record(|r| r.state.fill = FillColor::Pattern(lossy(name)));
         self
     }
 
@@ -497,8 +488,7 @@ impl Content {
 
     pub(crate) fn set_font(&mut self, font: Name, size: f32) -> &mut Self {
         self.inner.set_font(font, size);
-        let name = String::from_utf8_lossy(font.0).into_owned();
-        self.record(|r| r.state.font = Some((name, size)));
+        self.record(|r| r.state.font = Some((lossy(font), size)));
         self
     }
 
@@ -551,49 +541,54 @@ impl Content {
 
     pub(crate) fn show(&mut self, text: Str) -> &mut Self {
         self.inner.show(text);
-        let items = vec![TjItem::Text(text.0.to_vec())];
-        self.record(|r| r.show(items));
+        self.record(|r| r.show(vec![TjItem::Text(text.0.to_vec())]));
         self
     }
 
     /// `TJ`, written compactly (`TjArray`).
     pub(crate) fn show_array(&mut self, items: &[TjItem]) -> &mut Self {
         self.inner.op("TJ").operand(TjArray(items));
-        let items = items.to_vec();
-        self.record(|r| r.show(items));
+        self.record(|r| r.show(items.to_vec()));
         self
     }
 
     /// `TJ` as pdf-writer writes it: items separated by spaces.
-    pub(crate) fn show_positioned(&mut self) -> ShowPositioned<'_> {
-        ShowPositioned {
-            content: self,
-            items: Vec::new(),
+    pub(crate) fn show_positioned(&mut self, items: &[TjItem]) -> &mut Self {
+        {
+            let mut show = self.inner.show_positioned();
+            let mut writer = show.items();
+            for item in items {
+                match item {
+                    TjItem::Text(text) => writer.show(Str(text)),
+                    TjItem::Adjust(adjust) => writer.adjust(*adjust),
+                };
+            }
         }
+        self.record(|r| r.show(items.to_vec()));
+        self
     }
 
     // XObjects and marked content
 
     pub(crate) fn x_object(&mut self, name: Name) -> &mut Self {
         self.inner.x_object(name);
-        let name = String::from_utf8_lossy(name.0).into_owned();
-        self.record(|r| r.push(Rec::XObject(name)));
+        self.record(|r| r.push(Rec::XObject(lossy(name))));
         self
     }
 
     pub(crate) fn begin_marked_content(&mut self, tag: Name) -> &mut Self {
         self.inner.begin_marked_content(tag);
-        self.record_marked(tag, None);
+        self.record(|r| r.push(Rec::BeginMarked(lossy(tag))));
         self
     }
 
-    /// `/tag <</MCID mcid>> BDC`: content of a structure element.
-    pub(crate) fn begin_tagged(&mut self, tag: Name, mcid: i32) -> &mut Self {
+    /// `/kind <</MCID mcid>> BDC`: content of a structure element.
+    pub(crate) fn begin_tagged(&mut self, kind: StructType, mcid: i32) -> &mut Self {
         self.inner
-            .begin_marked_content_with_properties(tag)
+            .begin_marked_content_with_properties(Name(kind.name().as_bytes()))
             .properties()
             .identify(mcid);
-        self.record_marked(tag, Some(mcid));
+        self.record(|r| r.push(Rec::BeginTagged { kind, mcid }));
         self
     }
 
@@ -602,59 +597,10 @@ impl Content {
         self.record(|r| r.push(Rec::EndMarked));
         self
     }
-
-    fn record_marked(&mut self, tag: Name, mcid: Option<i32>) {
-        let tag = String::from_utf8_lossy(tag.0).into_owned();
-        self.record(|r| r.push(Rec::BeginMarked { tag, mcid }));
-    }
 }
 
-/// `Content::show_positioned`: the items are written, and recorded, when
-/// this is dropped.
-pub(crate) struct ShowPositioned<'a> {
-    content: &'a mut Content,
-    items: Vec<TjItem>,
-}
-
-impl ShowPositioned<'_> {
-    pub(crate) fn items(&mut self) -> PositionedItems<'_> {
-        PositionedItems {
-            items: &mut self.items,
-        }
-    }
-}
-
-impl Drop for ShowPositioned<'_> {
-    fn drop(&mut self) {
-        let items = std::mem::take(&mut self.items);
-        {
-            let mut show = self.content.inner.show_positioned();
-            let mut writer = show.items();
-            for item in &items {
-                match item {
-                    TjItem::Text(text) => writer.show(Str(text)),
-                    TjItem::Adjust(adjust) => writer.adjust(*adjust),
-                };
-            }
-        }
-        self.content.record(|r| r.show(items));
-    }
-}
-
-pub(crate) struct PositionedItems<'a> {
-    items: &'a mut Vec<TjItem>,
-}
-
-impl PositionedItems<'_> {
-    pub(crate) fn show(&mut self, text: Str) -> &mut Self {
-        self.items.push(TjItem::Text(text.0.to_vec()));
-        self
-    }
-
-    pub(crate) fn adjust(&mut self, amount: f32) -> &mut Self {
-        self.items.push(TjItem::Adjust(amount));
-        self
-    }
+fn lossy(name: Name) -> String {
+    String::from_utf8_lossy(name.0).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -690,7 +636,8 @@ impl Default for State {
                 cap: LineCap::Butt,
                 join: LineJoin::Miter,
                 miter_limit: 10.0,
-                dash: (Vec::new(), 0.0),
+                dash: Vec::new(),
+                dash_phase: 0.0,
             },
             font: None,
             char_spacing: 0.0,
@@ -953,7 +900,7 @@ mod tests {
         let (bytes, items) = recorded(|c| {
             c.begin_marked_content(Name(b"Artifact"));
             c.end_marked_content();
-            c.begin_tagged(Name(b"P"), 3);
+            c.begin_tagged(StructType::P, 3);
             c.end_marked_content();
         });
         let mut plain = pdf_writer::Content::new();
@@ -966,21 +913,18 @@ mod tests {
         plain.end_marked_content();
         assert_eq!(bytes, plain.finish().to_vec());
         let [
-            Rec::BeginMarked {
-                tag: artifact,
-                mcid: None,
-            },
+            Rec::BeginMarked(artifact),
             Rec::EndMarked,
-            Rec::BeginMarked {
-                tag: p,
-                mcid: Some(3),
+            Rec::BeginTagged {
+                kind: StructType::P,
+                mcid: 3,
             },
             Rec::EndMarked,
         ] = items.as_slice()
         else {
             panic!("unexpected items: {items:?}");
         };
-        assert_eq!((artifact.as_str(), p.as_str()), ("Artifact", "P"));
+        assert_eq!(artifact, "Artifact");
     }
 
     #[test]

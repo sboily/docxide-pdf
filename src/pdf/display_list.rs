@@ -6,8 +6,9 @@
 use std::collections::HashMap;
 
 use crate::display::{
-    DisplayDocument, FillRule, Font, FontSource, Glyph, GradientStop, Info, Item, LinearGradient,
-    Link, LinkTarget, Mark, Matrix, OutlineEntry, Page, Paint, Path, Segment, Structure, TextRun,
+    ArtifactKind, Document as DisplayDocument, FillRule, Font, FontSource, Glyph, GlyphId,
+    GradientStop, Info, Item, LinearGradient, Link, LinkTarget, Mark, Matrix, OutlineEntry, Page,
+    Paint, Path, Segment, Structure, TextRun, TextStroke, Unsupported,
 };
 use crate::fonts::FontEntry;
 use crate::model::Document;
@@ -95,11 +96,14 @@ impl<'a> Builder<'a> {
         let mut items = Vec::new();
         if let Some(header_footer) = page.header_footer {
             let mut group: Vec<Item> = page.zoom.map(Item::Transform).into_iter().collect();
-            group.extend(artifact(self.stream(header_footer), true));
+            group.extend(artifact(
+                self.stream(header_footer),
+                Some(ArtifactKind::Pagination),
+            ));
             items.push(Item::Group(group));
         }
         if let Some(borders) = page.borders {
-            items.push(Item::Group(artifact(self.stream(borders), false)));
+            items.push(Item::Group(artifact(self.stream(borders), None)));
         }
         let mut zoomed: Vec<Item> = page.zoom.map(Item::Transform).into_iter().collect();
         for stream in page.body {
@@ -109,7 +113,7 @@ impl<'a> Builder<'a> {
         body.push(Item::Group(zoomed));
         items.push(Item::Group(body));
         if let Some(pane) = page.comment_pane {
-            items.push(Item::Group(artifact(self.stream(pane), false)));
+            items.push(Item::Group(artifact(self.stream(pane), None)));
         }
         self.document.pages.push(Page {
             width: page.width,
@@ -140,7 +144,7 @@ impl<'a> Builder<'a> {
         self.document
     }
 
-    fn unsupported(&mut self, what: &'static str) {
+    fn unsupported(&mut self, what: Unsupported) {
         *self.document.unsupported.entry(what).or_default() += 1;
     }
 
@@ -183,7 +187,7 @@ impl<'a> Builder<'a> {
                         fill_rule,
                         gradient: gradient.clone(),
                     }),
-                    None => self.unsupported("pattern not described"),
+                    None => self.unsupported(Unsupported::Pattern),
                 },
                 Rec::Fill {
                     path,
@@ -208,10 +212,15 @@ impl<'a> Builder<'a> {
                         out.push(Item::Text(run));
                     }
                 }
-                Rec::BeginMarked { tag, mcid } => {
-                    let mark = self.mark(tag, mcid);
-                    self.marks.push(mark.is_some());
-                    out.extend(mark.map(Item::BeginMarked));
+                Rec::BeginMarked(tag) => {
+                    let mark = (tag == "Artifact").then_some(Mark::Artifact(None));
+                    self.begin_marked(mark, &mut out);
+                }
+                Rec::BeginTagged { kind, mcid } => {
+                    let mark = u32::try_from(mcid)
+                        .ok()
+                        .map(|mcid| Mark::Content { kind, mcid });
+                    self.begin_marked(mark, &mut out);
                 }
                 // An end without its beginning is ignored, as viewers do.
                 Rec::EndMarked => {
@@ -226,7 +235,7 @@ impl<'a> Builder<'a> {
                     };
                     match reference {
                         Some(r) => out.extend(self.xobject(r, depth)),
-                        None => self.unsupported("xobject without a name"),
+                        None => self.unsupported(Unsupported::UnnamedXObject),
                     }
                 }
             }
@@ -234,20 +243,14 @@ impl<'a> Builder<'a> {
         out
     }
 
-    /// A marked sequence: a structure element's content (it has an MCID), or
-    /// an artifact. Other marks are counted and left out, their content kept.
-    fn mark(&mut self, tag: String, mcid: Option<i32>) -> Option<Mark> {
-        let mark = match mcid {
-            Some(mcid) => u32::try_from(mcid)
-                .ok()
-                .map(|mcid| Mark::Element { tag, mcid }),
-            None if tag == "Artifact" => Some(Mark::Artifact { pagination: false }),
-            None => None,
-        };
-        if mark.is_none() {
-            self.unsupported("marked content not described");
+    /// Opens a marked sequence: a structure element's content, or an
+    /// artifact. Another mark is counted and left out, what it draws kept.
+    fn begin_marked(&mut self, mark: Option<Mark>, out: &mut Vec<Item>) {
+        self.marks.push(mark.is_some());
+        match mark {
+            Some(mark) => out.push(Item::BeginMarked(mark)),
+            None => self.unsupported(Unsupported::MarkedContent),
         }
-        mark
     }
 
     /// A pattern stroked, or text painted with one, is not described yet: counted, not drawn.
@@ -255,7 +258,7 @@ impl<'a> Builder<'a> {
         match paint {
             RecPaint::Solid(paint) => Some(paint),
             RecPaint::Pattern(_) => {
-                self.unsupported("gradient text or stroke");
+                self.unsupported(Unsupported::GradientTextOrStroke);
                 None
             }
         }
@@ -266,31 +269,26 @@ impl<'a> Builder<'a> {
             Some(Captured::Image(..)) => self.image(reference).map(Item::Image),
             Some(Captured::Form {
                 bbox,
-                matrix,
                 items,
                 xobjects,
             }) => {
                 if depth >= MAX_FORM_DEPTH {
-                    self.unsupported("form nested too deep");
+                    self.unsupported(Unsupported::FormTooDeep);
                     return None;
                 }
                 let local: HashMap<String, i32> = xobjects.iter().cloned().collect();
                 let [x0, y0, x1, y1] = *bbox;
-                let mut group = Vec::new();
-                if *matrix != IDENTITY {
-                    group.push(Item::Transform(*matrix));
-                }
-                group.push(Item::Clip {
+                let mut group = vec![Item::Clip {
                     path: Path(vec![Segment::Rect(x0, y0, x1 - x0, y1 - y0)]),
                     fill_rule: FillRule::NonZero,
-                });
+                }];
                 let saved = std::mem::take(&mut self.text_ends);
                 group.extend(self.items(items.clone(), Some(&local), depth + 1));
                 self.text_ends = saved;
                 Some(Item::Group(group))
             }
             None => {
-                self.unsupported("xobject not recorded");
+                self.unsupported(Unsupported::UnrecordedXObject);
                 None
             }
         }
@@ -309,7 +307,7 @@ impl<'a> Builder<'a> {
         if let Some(mask) = mask {
             match self.xobjects.get(mask) {
                 Some(Captured::Image(mask, _)) => image.soft_mask = Some(Box::new(mask.clone())),
-                _ => self.unsupported("soft mask not recorded"),
+                _ => self.unsupported(Unsupported::UnrecordedSoftMask),
             }
         }
         let index = self.document.images.len();
@@ -335,7 +333,7 @@ impl<'a> Builder<'a> {
                 index: entry.face_index,
             }
         } else {
-            self.unsupported("font without a source");
+            self.unsupported(Unsupported::FontWithoutSource);
             return None;
         };
         let name = entry
@@ -354,7 +352,7 @@ impl<'a> Builder<'a> {
     fn text(&mut self, text: RecText) -> Option<TextRun> {
         let fonts = &self.fonts;
         let Some(&entry) = fonts.get(text.font.as_str()) else {
-            self.unsupported("text in an unknown font");
+            self.unsupported(Unsupported::UnknownFont);
             return None;
         };
         let font = self.font(entry)?;
@@ -388,8 +386,11 @@ impl<'a> Builder<'a> {
         self.text_ends
             .insert(text.text_object, concat(translate(pen, 0.0), matrix));
         let fill = self.text_paint(text.fill);
-        let (stroke_paint, line_width) = text.stroke;
-        let stroke = self.text_paint(stroke_paint);
+        let (stroke_paint, width) = text.stroke;
+        let stroke = TextStroke {
+            paint: self.text_paint(stroke_paint),
+            width,
+        };
         Some(TextRun {
             font,
             size,
@@ -397,7 +398,7 @@ impl<'a> Builder<'a> {
             horizontal_scaling: scale,
             mode: text.mode,
             fill,
-            stroke: Some((stroke, line_width)),
+            stroke,
             glyphs,
         })
     }
@@ -414,18 +415,17 @@ impl<'a> Builder<'a> {
 /// Ends the marked sequence open in `items`. An artifact with nothing in it
 /// is dropped, as `tagging::finish_artifact_content` drops it.
 fn end_marked(items: &mut Vec<Item>) {
-    if matches!(items.last(), Some(Item::BeginMarked(Mark::Artifact { .. }))) {
+    if matches!(items.last(), Some(Item::BeginMarked(Mark::Artifact(_)))) {
         items.pop();
     } else {
         items.push(Item::EndMarked);
     }
 }
 
-/// `items` as one artifact, of the page's pagination (headers and footers)
-/// or not.
-fn artifact(items: Vec<Item>, pagination: bool) -> Vec<Item> {
+/// `items` as one artifact of type `kind`.
+fn artifact(items: Vec<Item>, kind: Option<ArtifactKind>) -> Vec<Item> {
     let mut wrapped = Vec::with_capacity(items.len() + 2);
-    wrapped.push(Item::BeginMarked(Mark::Artifact { pagination }));
+    wrapped.push(Item::BeginMarked(Mark::Artifact(kind)));
     wrapped.extend(items);
     end_marked(&mut wrapped);
     wrapped
@@ -454,7 +454,7 @@ fn gradient(spec: &GradientSpec) -> LinearGradient {
 /// The glyphs `bytes` show in `entry`: two-byte codes of an embedded font
 /// (`FontEntry::code_glyphs`), WinAnsi bytes of a standard one. A code the
 /// font has no glyph for draws `.notdef`, which advances by nothing.
-fn decode(entry: &FontEntry, bytes: &[u8]) -> Vec<(u16, String, f32)> {
+fn decode(entry: &FontEntry, bytes: &[u8]) -> Vec<(GlyphId, String, f32)> {
     if entry.standard_font.is_some() || entry.char_to_gid.is_none() {
         return bytes
             .iter()
@@ -465,7 +465,7 @@ fn decode(entry: &FontEntry, bytes: &[u8]) -> Vec<(u16, String, f32)> {
                     .copied()
                     .unwrap_or(0.0);
                 let text = crate::fonts::winansi_to_char(byte).to_string();
-                (u16::from(byte), text, width)
+                (GlyphId::WinAnsi(byte), text, width)
             })
             .collect();
     }
@@ -474,8 +474,12 @@ fn decode(entry: &FontEntry, bytes: &[u8]) -> Vec<(u16, String, f32)> {
         .map(|pair| {
             let code = u16::from_be_bytes([pair[0], pair.get(1).copied().unwrap_or(0)]);
             match entry.code_glyphs.get(&code) {
-                Some(glyph) => (glyph.gid, glyph.text.clone(), glyph.width_1000),
-                None => (0, String::new(), 0.0),
+                Some(glyph) => (
+                    GlyphId::Gid(glyph.gid),
+                    glyph.text.clone(),
+                    glyph.width_1000,
+                ),
+                None => (GlyphId::Gid(0), String::new(), 0.0),
             }
         })
         .collect()
@@ -514,12 +518,13 @@ pub(super) fn links(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display::StructType;
 
     #[test]
     fn decodes_winansi_with_standard_widths() {
         let entry = FontEntry::stub();
         let glyphs = decode(&entry, b"A ");
-        assert_eq!(glyphs[0].0, u16::from(b'A'));
+        assert_eq!(glyphs[0].0, GlyphId::WinAnsi(b'A'));
         assert_eq!(glyphs[0].1, "A");
         assert_eq!(glyphs[1].2, 500.0);
     }
@@ -577,11 +582,8 @@ mod tests {
         }
     }
 
-    fn marked(tag: &str, mcid: Option<i32>) -> Rec {
-        Rec::BeginMarked {
-            tag: tag.into(),
-            mcid,
-        }
+    fn artifact_begins() -> Rec {
+        Rec::BeginMarked("Artifact".into())
     }
 
     #[test]
@@ -592,26 +594,31 @@ mod tests {
         // As `tagging` writes a body stream: the artifact, closed for a tagged
         // region and opened again, left open for the end of the stream.
         let items = builder.stream(vec![
-            marked("Artifact", None),
+            artifact_begins(),
             Rec::EndMarked,
-            marked("P", Some(0)),
+            Rec::BeginTagged {
+                kind: StructType::P,
+                mcid: 0,
+            },
             Rec::Group(vec![square(), Rec::EndMarked]),
-            marked("Artifact", None),
+            artifact_begins(),
             square(),
             Rec::EndMarked,
             Rec::EndMarked,
         ]);
         let [
-            Item::BeginMarked(Mark::Element { tag, mcid: 0 }),
+            Item::BeginMarked(Mark::Content {
+                kind: StructType::P,
+                mcid: 0,
+            }),
             Item::Group(group),
-            Item::BeginMarked(Mark::Artifact { pagination: false }),
+            Item::BeginMarked(Mark::Artifact(None)),
             Item::Fill { .. },
             Item::EndMarked,
         ] = items.as_slice()
         else {
             panic!("unexpected items: {items:?}");
         };
-        assert_eq!(tag, "P");
         assert!(matches!(
             group.as_slice(),
             [Item::Fill { .. }, Item::EndMarked]
@@ -630,7 +637,7 @@ mod tests {
             borders: Some(vec![square()]),
             zoom: None,
             valign: None,
-            body: vec![vec![marked("Artifact", None), square()]],
+            body: vec![vec![artifact_begins(), square()]],
             comment_pane: None,
         };
         builder.add_page(page, Vec::new(), &[]);
@@ -642,7 +649,7 @@ mod tests {
         assert!(matches!(
             header.as_slice(),
             [
-                Item::BeginMarked(Mark::Artifact { pagination: true }),
+                Item::BeginMarked(Mark::Artifact(Some(ArtifactKind::Pagination))),
                 Item::Fill { .. },
                 Item::EndMarked
             ]
@@ -650,7 +657,7 @@ mod tests {
         assert!(matches!(
             borders.as_slice(),
             [
-                Item::BeginMarked(Mark::Artifact { pagination: false }),
+                Item::BeginMarked(Mark::Artifact(None)),
                 Item::Fill { .. },
                 Item::EndMarked
             ]
@@ -663,5 +670,25 @@ mod tests {
             panic!("unexpected body: {zoomed:?}");
         };
         assert!(matches!(stream.last(), Some(Item::EndMarked)));
+    }
+
+    #[test]
+    fn another_mark_is_counted_and_what_it_draws_kept() {
+        let fonts = HashMap::new();
+        let xobjects = HashMap::new();
+        let mut builder = Builder::new(&fonts, &[], &xobjects);
+        let items = builder.stream(vec![
+            Rec::BeginMarked("Span".into()),
+            square(),
+            Rec::EndMarked,
+        ]);
+        assert!(matches!(items.as_slice(), [Item::Fill { .. }]));
+        assert_eq!(
+            builder
+                .document
+                .unsupported
+                .get(&Unsupported::MarkedContent),
+            Some(&1)
+        );
     }
 }

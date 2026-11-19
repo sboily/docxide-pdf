@@ -666,7 +666,7 @@ pub(super) fn assemble_pdf_pages(
                     level: entry.level,
                     title: entry.title.clone(),
                     page: entry.page_idx,
-                    y: entry.y_position,
+                    top: entry.y_position,
                 })
                 .collect();
             let document = builder.finish(doc, lang, structure, outline, claims_ua);
